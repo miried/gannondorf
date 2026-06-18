@@ -1,1 +1,4 @@
 /target
+tools/MSDEV/
+tools/objdiff-cli-macos-arm64
+
