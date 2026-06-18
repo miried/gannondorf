@@ -4,16 +4,18 @@
 
 This repo is a Rust prototype for extracting functions from Win32 PE executables into standalone COFF object files.
 
-The current implementation is an MVP for explicit-address extraction from PE32/i386 images:
+The current implementation is an MVP for extracting functions from PE32/i386 images:
 
 - CLI: `unlink <input.exe> --address <addr> [-o <output.obj>]`
+- CLI: `unlink <input.exe> [-o <output-dir>]`
 - Library entrypoint: `extract_function_object(image, requested_address)`
+- Library entrypoints: `discover_function_addresses(image)` and `extract_function_objects(image)`
 - Address parsing accepts decimal and `0x`/`0X` hex.
 - Addresses below the PE image base are treated as RVAs; addresses at or above image base are treated as VAs.
 - Only PE32/i386 is supported.
-- Automatic all-function discovery is not implemented yet; omitting `--address` returns a clear error.
+- Omitting `--address` discovers functions automatically and writes one `sub_XXXXXXXX.obj` per function. In automatic mode, `-o/--output` is an output directory.
 
-The repo is currently entirely untracked in git (`git status --short` shows all files as `??`), so do not assume `git diff` will show useful changes until files are added.
+Current git status has tracked edits in `HANDOVER.md`, `README.md`, `src/lib.rs`, and `src/main.rs`; `tools/` remains untracked and unrelated to this step.
 
 ## Implemented Behavior
 
@@ -23,7 +25,13 @@ Core implementation is in `src/lib.rs`.
 - Validates architecture is `Architecture::I386`.
 - Finds the containing `.text` section for the requested function address.
 - Decodes from the requested address with `iced_x86::Decoder::with_ip(32, ...)`.
-- Stops extraction at the first return instruction.
+- Stops extraction at the first return instruction after any forward non-call branch targets seen so far.
+- Discovers automatic function candidates from:
+  - The PE `.text` entrypoint.
+  - Direct call targets found while scanning `.text`.
+  - Direct call/unconditional-branch targets found while decoding discovered functions.
+  - Common i386 frame prologues (`push ebp; mov ebp, esp`) as a fallback.
+- Automatic outputs are sorted by VA and named deterministically as `sub_XXXXXXXX.obj`.
 - Reconstructs COFF relocations:
   - PE `IMAGE_REL_BASED_HIGHLOW` entries inside the extracted byte range become `IMAGE_REL_I386_DIR32`.
   - Direct external near calls/jumps discovered via iced-x86 branch immediates become `IMAGE_REL_I386_REL32`.
@@ -78,19 +86,34 @@ Observed expected result:
   - `0xB IMAGE_REL_I386_DIR32 data_00406030`
   - `0x10 IMAGE_REL_I386_DIR32 data_00406030`
 
+Automatic discovery smoke test performed:
+
+```sh
+cargo run -- tests/TEST00.exe -o /tmp/unlink-auto-test
+llvm-readobj --file-headers --sections --symbols --relocations /tmp/unlink-auto-test/sub_004010C0.obj
+```
+
+Observed expected result:
+
+- 74 function objects written for `TEST00.exe`.
+- Entry object `sub_004010C0.obj` is COFF-i386.
+- Entry object has `.text` relocations for external code and data references.
+
 Unit tests in `src/lib.rs` cover:
 
 - Address parsing.
 - Extracting `0x401000` with no relocations.
 - Extracting `0x401017` with two absolute relocations.
 - Extracting `0x401035` with one relative call relocation.
+- Discovering entrypoint, direct-call target, and prologue-fallback functions.
+- Extracting discovered functions as COFF-i386 objects.
 - Treating small addresses as RVAs.
 - Erroring on non-executable addresses.
 
 ## Known Limits
 
-- Function boundary detection is linear and stops at the first return. It does not yet follow control flow or handle multiple returns robustly.
-- No automatic function discovery.
+- Function boundary detection is still mostly linear. It tracks forward non-call branch targets, but does not yet build a full CFG.
+- Automatic function discovery is heuristic and can include runtime helper thunks, exception handlers, and other code labels from `.text`, not just source-level functions.
 - No PE64/x86_64 support.
 - No import table symbol naming; unresolved references use synthetic names.
 - No original symbol recovery from PDB, exports, maps, or COFF symbol tables.
@@ -105,10 +128,10 @@ Unit tests in `src/lib.rs` cover:
    - Stop at the reachable instruction set rather than first return.
    - Handle multiple returns and internal forward/backward branches.
 
-2. Add automatic function discovery for PE32/i386.
-   - Start with `.text` entrypoint plus direct branch/call targets.
-   - Consider prologue heuristics only as a fallback.
-   - Emit one object per discovered function, with deterministic output names.
+2. Improve automatic discovery precision for PE32/i386.
+   - Reduce false candidates from linear `.text` scanning.
+   - Distinguish source-level function starts from exception handlers, thunks, and internal labels where possible.
+   - Use exports/symbols when available as stronger seeds.
 
 3. Improve symbol naming.
    - Use PE exports when available.
@@ -136,4 +159,3 @@ Unit tests in `src/lib.rs` cover:
 - `tests/TEST00.CPP`: source for the PE/object fixture.
 - `tests/TEST00.exe`: PE32 fixture used by tests.
 - `tests/TEST00.obj`: original COFF object fixture for comparison.
-

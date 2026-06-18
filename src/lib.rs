@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -43,6 +43,14 @@ pub struct ExtractedObject {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct PeI386Image<'data> {
+    image_base: u64,
+    entry_va: u64,
+    sections: Vec<ImageSection<'data>>,
+    base_relocations: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ImageSection<'data> {
     address: u64,
@@ -65,9 +73,17 @@ struct DecodedInstruction {
 
 #[derive(Debug, Clone)]
 struct BranchReference {
+    kind: DirectBranchKind,
     target: u64,
     operand_offset: u64,
     operand_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectBranchKind {
+    Call,
+    UnconditionalBranch,
+    ConditionalBranch,
 }
 
 pub fn parse_address(input: &str) -> Result<u64> {
@@ -88,33 +104,210 @@ pub fn default_output_path(symbol_name: &str) -> PathBuf {
 }
 
 pub fn extract_function_object(image: &[u8], requested_address: u64) -> Result<ExtractedObject> {
-    let file = PeFile32::parse(image)
-        .map_err(|err| UnlinkError::new(format!("failed to parse PE32 image: {err}")))?;
-    if file.architecture() != Architecture::I386 {
-        return Err(UnlinkError::new(format!(
-            "unsupported architecture {:?}; only PE32/i386 is implemented",
-            file.architecture()
-        )));
+    let image = PeI386Image::parse(image)?;
+    let function_va = normalize_address(requested_address, image.image_base);
+    let function = image.decode_function(function_va)?;
+    write_extracted_object(&function, &image)
+}
+
+pub fn discover_function_addresses(image: &[u8]) -> Result<Vec<u64>> {
+    let image = PeI386Image::parse(image)?;
+    Ok(discover_function_images(&image)?.keys().copied().collect())
+}
+
+pub fn extract_function_objects(image: &[u8]) -> Result<Vec<ExtractedObject>> {
+    let image = PeI386Image::parse(image)?;
+    discover_function_images(&image)?
+        .values()
+        .map(|function| write_extracted_object(function, &image))
+        .collect()
+}
+
+impl<'data> PeI386Image<'data> {
+    fn parse(image: &'data [u8]) -> Result<Self> {
+        let file = PeFile32::parse(image)
+            .map_err(|err| UnlinkError::new(format!("failed to parse PE32 image: {err}")))?;
+        if file.architecture() != Architecture::I386 {
+            return Err(UnlinkError::new(format!(
+                "unsupported architecture {:?}; only PE32/i386 is implemented",
+                file.architecture()
+            )));
+        }
+
+        let image_base = file.relative_address_base();
+        let entry_va = file.entry();
+        let sections = collect_sections(&file)?;
+        let base_relocations = collect_base_relocations(&file, image_base)?;
+
+        Ok(Self {
+            image_base,
+            entry_va,
+            sections,
+            base_relocations,
+        })
     }
 
-    let image_base = file.relative_address_base();
-    let function_va = normalize_address(requested_address, image_base);
-    let sections = collect_sections(&file)?;
-    let section = find_text_section(&sections, function_va).ok_or_else(|| {
-        UnlinkError::new(format!(
-            "address 0x{function_va:08X} is not inside an executable section"
-        ))
-    })?;
-    let function = decode_function(section, function_va)?;
-    let base_relocations = collect_base_relocations(&file, image_base)?;
-    let symbol_name = code_symbol_name(function_va);
-    let bytes = write_coff_object(&function, &sections, &base_relocations, &symbol_name)?;
+    fn decode_function(&self, function_va: u64) -> Result<FunctionImage> {
+        let section = find_text_section(&self.sections, function_va).ok_or_else(|| {
+            UnlinkError::new(format!(
+                "address 0x{function_va:08X} is not inside an executable section"
+            ))
+        })?;
+        decode_function(section, function_va)
+    }
+}
+
+fn write_extracted_object(
+    function: &FunctionImage,
+    image: &PeI386Image<'_>,
+) -> Result<ExtractedObject> {
+    let symbol_name = code_symbol_name(function.va);
+    let bytes = write_coff_object(
+        function,
+        &image.sections,
+        &image.base_relocations,
+        &symbol_name,
+    )?;
 
     Ok(ExtractedObject {
         symbol_name,
-        function_va,
+        function_va: function.va,
         function_len: function.bytes.len() as u64,
         bytes,
+    })
+}
+
+fn discover_function_images(image: &PeI386Image<'_>) -> Result<BTreeMap<u64, FunctionImage>> {
+    let mut pending = BTreeSet::new();
+    if address_is_text(&image.sections, image.entry_va) {
+        pending.insert(image.entry_va);
+    }
+    pending.extend(collect_text_call_targets(&image.sections));
+
+    let mut functions = BTreeMap::new();
+    drain_discovery_queue(image, &mut pending, &mut functions);
+
+    for candidate in collect_i386_prologue_candidates(&image.sections) {
+        if !known_function_contains(&functions, candidate) {
+            pending.insert(candidate);
+        }
+    }
+    drain_discovery_queue(image, &mut pending, &mut functions);
+
+    if functions.is_empty() {
+        return Err(UnlinkError::new(
+            "no PE32/i386 functions were discovered in executable sections",
+        ));
+    }
+
+    Ok(functions)
+}
+
+fn drain_discovery_queue(
+    image: &PeI386Image<'_>,
+    pending: &mut BTreeSet<u64>,
+    functions: &mut BTreeMap<u64, FunctionImage>,
+) {
+    while let Some(function_va) = pending.pop_first() {
+        if functions.contains_key(&function_va) || known_function_contains(functions, function_va) {
+            continue;
+        }
+
+        let Ok(function) = image.decode_function(function_va) else {
+            continue;
+        };
+
+        queue_function_targets(image, &function, functions, pending);
+        functions.insert(function_va, function);
+    }
+}
+
+fn queue_function_targets(
+    image: &PeI386Image<'_>,
+    function: &FunctionImage,
+    functions: &BTreeMap<u64, FunctionImage>,
+    pending: &mut BTreeSet<u64>,
+) {
+    for instruction in &function.instructions {
+        let Some(branch) = &instruction.branch else {
+            continue;
+        };
+        if branch.kind == DirectBranchKind::ConditionalBranch {
+            continue;
+        }
+        if !address_is_text(&image.sections, branch.target) {
+            continue;
+        }
+        if contains_range(function.va, function.bytes.len() as u64, branch.target, 1) {
+            continue;
+        }
+        if functions.contains_key(&branch.target)
+            || known_function_contains(functions, branch.target)
+        {
+            continue;
+        }
+        pending.insert(branch.target);
+    }
+}
+
+fn collect_text_call_targets(sections: &[ImageSection<'_>]) -> BTreeSet<u64> {
+    let mut targets = BTreeSet::new();
+    for section in sections
+        .iter()
+        .copied()
+        .filter(|section| section.kind == SectionKind::Text)
+    {
+        let mut decoder = Decoder::with_ip(32, section.data, section.address, DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            if instruction.is_invalid() {
+                continue;
+            }
+            let constants = decoder.get_constant_offsets(&instruction);
+            if instruction.flow_control() == FlowControl::Call && constants.has_immediate() {
+                let target = instruction.near_branch_target();
+                if address_is_text(sections, target) {
+                    targets.insert(target);
+                }
+            }
+        }
+    }
+    targets
+}
+
+fn collect_i386_prologue_candidates(sections: &[ImageSection<'_>]) -> BTreeSet<u64> {
+    let mut candidates = BTreeSet::new();
+    for section in sections
+        .iter()
+        .copied()
+        .filter(|section| section.kind == SectionKind::Text)
+    {
+        for offset in 0..section.data.len() {
+            if !has_i386_frame_prologue(section.data, offset) {
+                continue;
+            }
+
+            let start = if offset >= 2 && section.data[offset - 2..offset] == [0x8B, 0xFF] {
+                offset - 2
+            } else {
+                offset
+            };
+            candidates.insert(section.address + start as u64);
+        }
+    }
+    candidates
+}
+
+fn has_i386_frame_prologue(bytes: &[u8], offset: usize) -> bool {
+    bytes
+        .get(offset..offset + 3)
+        .is_some_and(|bytes| bytes == [0x55, 0x8B, 0xEC] || bytes == [0x55, 0x89, 0xE5])
+}
+
+fn known_function_contains(functions: &BTreeMap<u64, FunctionImage>, address: u64) -> bool {
+    functions.iter().any(|(&function_va, function)| {
+        address != function_va
+            && contains_range(function_va, function.bytes.len() as u64, address, 1)
     })
 }
 
@@ -163,6 +356,7 @@ fn decode_function(section: ImageSection<'_>, function_va: u64) -> Result<Functi
 
     let mut decoder = Decoder::with_ip(32, bytes, function_va, DecoderOptions::NONE);
     let mut instructions = Vec::new();
+    let mut farthest_forward_branch_target = function_va;
 
     while decoder.can_decode() {
         let instruction = decoder.decode();
@@ -175,8 +369,11 @@ fn decode_function(section: ImageSection<'_>, function_va: u64) -> Result<Functi
 
         let constants = decoder.get_constant_offsets(&instruction);
         let flow_control = instruction.flow_control();
-        let branch = if is_direct_branch(flow_control) && constants.has_immediate() {
+        let branch = if let Some(kind) = direct_branch_kind(flow_control)
+            && constants.has_immediate()
+        {
             Some(BranchReference {
+                kind,
                 target: instruction.near_branch_target(),
                 operand_offset: constants.immediate_offset() as u64,
                 operand_size: constants.immediate_size() as u32,
@@ -185,6 +382,14 @@ fn decode_function(section: ImageSection<'_>, function_va: u64) -> Result<Functi
             None
         };
 
+        if let Some(branch) = &branch
+            && branch.kind != DirectBranchKind::Call
+            && branch.target > farthest_forward_branch_target
+            && contains_range(section.address, section.data.len() as u64, branch.target, 1)
+        {
+            farthest_forward_branch_target = branch.target;
+        }
+
         let instruction_va = instruction.ip();
         let next_ip = instruction.next_ip();
         instructions.push(DecodedInstruction {
@@ -192,7 +397,7 @@ fn decode_function(section: ImageSection<'_>, function_va: u64) -> Result<Functi
             branch,
         });
 
-        if flow_control == FlowControl::Return {
+        if flow_control == FlowControl::Return && next_ip > farthest_forward_branch_target {
             let function_len = next_ip
                 .checked_sub(function_va)
                 .ok_or_else(|| UnlinkError::new("decoded function length underflowed"))?
@@ -210,11 +415,13 @@ fn decode_function(section: ImageSection<'_>, function_va: u64) -> Result<Functi
     )))
 }
 
-fn is_direct_branch(flow_control: FlowControl) -> bool {
-    matches!(
-        flow_control,
-        FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch
-    )
+fn direct_branch_kind(flow_control: FlowControl) -> Option<DirectBranchKind> {
+    match flow_control {
+        FlowControl::Call => Some(DirectBranchKind::Call),
+        FlowControl::UnconditionalBranch => Some(DirectBranchKind::UnconditionalBranch),
+        FlowControl::ConditionalBranch => Some(DirectBranchKind::ConditionalBranch),
+        _ => None,
+    }
 }
 
 fn collect_base_relocations(file: &PeFile32<'_>, image_base: u64) -> Result<Vec<u64>> {
@@ -485,6 +692,41 @@ mod tests {
                 .any(|symbol| symbol.name() == Ok("sub_00401000"))
         );
         assert_eq!(&text.data().unwrap()[0x0B..0x0F], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn discovers_functions_from_entrypoint_calls_and_prologues() {
+        let addresses = discover_function_addresses(TEST00).unwrap();
+
+        assert!(addresses.windows(2).all(|window| window[0] < window[1]));
+        assert!(addresses.contains(&0x4010C0));
+        assert!(addresses.contains(&0x401054));
+        assert!(addresses.contains(&0x401000));
+        assert!(addresses.contains(&0x401017));
+        assert!(addresses.contains(&0x401035));
+    }
+
+    #[test]
+    fn extracts_discovered_functions_as_objects() {
+        let extracted = extract_function_objects(TEST00).unwrap();
+        let addresses: Vec<_> = extracted.iter().map(|object| object.function_va).collect();
+        let names: Vec<_> = extracted
+            .iter()
+            .map(|object| object.symbol_name.as_str())
+            .collect();
+
+        assert!(addresses.windows(2).all(|window| window[0] < window[1]));
+        assert!(names.contains(&"sub_00401000"));
+        assert!(names.contains(&"sub_00401017"));
+        assert!(names.contains(&"sub_00401035"));
+        assert!(names.contains(&"sub_00401054"));
+        assert!(names.contains(&"sub_004010C0"));
+
+        for object in extracted {
+            let file = object::File::parse(&*object.bytes).unwrap();
+            assert_eq!(file.format(), BinaryFormat::Coff);
+            assert_eq!(file.architecture(), Architecture::I386);
+        }
     }
 
     #[test]
