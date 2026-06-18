@@ -354,65 +354,162 @@ fn decode_function(section: ImageSection<'_>, function_va: u64) -> Result<Functi
         .get(section_offset..)
         .ok_or_else(|| UnlinkError::new("function address is outside section data"))?;
 
-    let mut decoder = Decoder::with_ip(32, bytes, function_va, DecoderOptions::NONE);
-    let mut instructions = Vec::new();
-    let mut farthest_forward_branch_target = function_va;
+    let mut pending = BTreeSet::new();
+    let mut instructions = BTreeMap::new();
+    let mut function_end = function_va;
+    pending.insert(function_va);
 
-    while decoder.can_decode() {
-        let instruction = decoder.decode();
-        if instruction.is_invalid() {
-            return Err(UnlinkError::new(format!(
-                "invalid instruction at 0x{:08X}",
-                instruction.ip()
-            )));
+    while let Some(block_va) = pending.pop_first() {
+        if block_va < function_va {
+            continue;
         }
 
-        let constants = decoder.get_constant_offsets(&instruction);
-        let flow_control = instruction.flow_control();
-        let branch = if let Some(kind) = direct_branch_kind(flow_control)
-            && constants.has_immediate()
-        {
-            Some(BranchReference {
-                kind,
-                target: instruction.near_branch_target(),
-                operand_offset: constants.immediate_offset() as u64,
-                operand_size: constants.immediate_size() as u32,
-            })
-        } else {
-            None
-        };
+        let mut instruction_va = block_va;
+        loop {
+            if instructions.contains_key(&instruction_va) {
+                break;
+            }
+            if !contains_range(
+                section.address,
+                section.data.len() as u64,
+                instruction_va,
+                1,
+            ) {
+                return Err(UnlinkError::new(format!(
+                    "control flow for function at 0x{function_va:08X} leaves executable section at 0x{instruction_va:08X}"
+                )));
+            }
 
-        if let Some(branch) = &branch
-            && branch.kind != DirectBranchKind::Call
-            && branch.target > farthest_forward_branch_target
-            && contains_range(section.address, section.data.len() as u64, branch.target, 1)
-        {
-            farthest_forward_branch_target = branch.target;
-        }
+            let (instruction, flow_control, next_ip) =
+                decode_reachable_instruction(section, instruction_va)?;
+            let branch = instruction.branch.clone();
+            function_end = function_end.max(next_ip);
+            instructions.insert(instruction_va, instruction);
 
-        let instruction_va = instruction.ip();
-        let next_ip = instruction.next_ip();
-        instructions.push(DecodedInstruction {
-            va: instruction_va,
-            branch,
-        });
-
-        if flow_control == FlowControl::Return && next_ip > farthest_forward_branch_target {
-            let function_len = next_ip
-                .checked_sub(function_va)
-                .ok_or_else(|| UnlinkError::new("decoded function length underflowed"))?
-                as usize;
-            return Ok(FunctionImage {
-                va: function_va,
-                bytes: bytes[..function_len].to_vec(),
-                instructions,
-            });
+            match flow_control {
+                FlowControl::Return
+                | FlowControl::IndirectBranch
+                | FlowControl::Interrupt
+                | FlowControl::Exception => break,
+                FlowControl::UnconditionalBranch => {
+                    if let Some(branch) = branch {
+                        queue_cfg_successor(section, function_va, &mut pending, branch.target);
+                    }
+                    break;
+                }
+                FlowControl::ConditionalBranch => {
+                    if let Some(branch) = branch {
+                        queue_cfg_successor(section, function_va, &mut pending, branch.target);
+                    }
+                    instruction_va = next_ip;
+                }
+                FlowControl::Call
+                | FlowControl::IndirectCall
+                | FlowControl::Next
+                | FlowControl::XbeginXabortXend => {
+                    instruction_va = next_ip;
+                }
+            }
         }
     }
 
-    Err(UnlinkError::new(format!(
-        "no return instruction found for function at 0x{function_va:08X}"
-    )))
+    if instructions.is_empty() {
+        return Err(UnlinkError::new(format!(
+            "no instructions found for function at 0x{function_va:08X}"
+        )));
+    }
+
+    let function_len = function_end
+        .checked_sub(function_va)
+        .ok_or_else(|| UnlinkError::new("decoded function length underflowed"))?
+        as usize;
+    Ok(FunctionImage {
+        va: function_va,
+        bytes: bytes[..function_len].to_vec(),
+        instructions: instructions.into_values().collect(),
+    })
+}
+
+fn decode_reachable_instruction(
+    section: ImageSection<'_>,
+    instruction_va: u64,
+) -> Result<(DecodedInstruction, FlowControl, u64)> {
+    let section_offset = instruction_va
+        .checked_sub(section.address)
+        .ok_or_else(|| UnlinkError::new("instruction address precedes section start"))?
+        as usize;
+    let bytes = section
+        .data
+        .get(section_offset..)
+        .ok_or_else(|| UnlinkError::new("instruction address is outside section data"))?;
+    let mut decoder = Decoder::with_ip(32, bytes, instruction_va, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return Err(UnlinkError::new(format!(
+            "invalid instruction at 0x{:08X}",
+            instruction.ip()
+        )));
+    }
+
+    let instruction_len = instruction.len() as u64;
+    if instruction_len == 0
+        || !contains_range(
+            section.address,
+            section.data.len() as u64,
+            instruction.ip(),
+            instruction_len,
+        )
+    {
+        return Err(UnlinkError::new(format!(
+            "incomplete instruction at 0x{:08X}",
+            instruction.ip()
+        )));
+    }
+
+    let next_ip = instruction.next_ip();
+    if next_ip <= instruction.ip() {
+        return Err(UnlinkError::new(format!(
+            "decoded instruction at 0x{:08X} did not advance",
+            instruction.ip()
+        )));
+    }
+
+    let constants = decoder.get_constant_offsets(&instruction);
+    let flow_control = instruction.flow_control();
+    let branch = if let Some(kind) = direct_branch_kind(flow_control)
+        && constants.has_immediate()
+    {
+        Some(BranchReference {
+            kind,
+            target: instruction.near_branch_target(),
+            operand_offset: constants.immediate_offset() as u64,
+            operand_size: constants.immediate_size() as u32,
+        })
+    } else {
+        None
+    };
+
+    Ok((
+        DecodedInstruction {
+            va: instruction.ip(),
+            branch,
+        },
+        flow_control,
+        next_ip,
+    ))
+}
+
+fn queue_cfg_successor(
+    section: ImageSection<'_>,
+    function_va: u64,
+    pending: &mut BTreeSet<u64>,
+    target: u64,
+) {
+    if target >= function_va
+        && contains_range(section.address, section.data.len() as u64, target, 1)
+    {
+        pending.insert(target);
+    }
 }
 
 fn direct_branch_kind(flow_control: FlowControl) -> Option<DirectBranchKind> {
@@ -650,5 +747,74 @@ mod tests {
         assert!(contains_range(0x1000, 0x20, 0x101C, 4));
         assert!(!contains_range(0x1000, 0x20, 0x101D, 4));
         assert!(!contains_range(0x1000, 0x20, 0x0FFF, 1));
+    }
+
+    #[test]
+    fn decodes_conditional_function_with_multiple_returns() {
+        #[rustfmt::skip]
+        let bytes = [
+            0x85, 0xC0,             // test eax, eax
+            0x74, 0x06,             // je 0x100A
+            0xB8, 0x01, 0, 0, 0,    // mov eax, 1
+            0xC3,                   // ret
+            0x31, 0xC0,             // xor eax, eax
+            0xC3,                   // ret
+        ];
+
+        let function = decode_test_function(&bytes).unwrap();
+
+        assert_eq!(function.bytes, bytes);
+        assert_eq!(instruction_offsets(&function), [0, 2, 4, 9, 10, 12]);
+    }
+
+    #[test]
+    fn decodes_backward_loop_to_exit_return() {
+        #[rustfmt::skip]
+        let bytes = [
+            0x31, 0xC0,             // xor eax, eax
+            0x40,                   // inc eax
+            0x83, 0xF8, 0x03,       // cmp eax, 3
+            0x7C, 0xFA,             // jl 0x1002
+            0xC3,                   // ret
+        ];
+
+        let function = decode_test_function(&bytes).unwrap();
+
+        assert_eq!(function.bytes, bytes);
+        assert_eq!(instruction_offsets(&function), [0, 2, 3, 6, 8]);
+    }
+
+    #[test]
+    fn skips_unreachable_bytes_between_direct_jump_and_return() {
+        #[rustfmt::skip]
+        let bytes = [
+            0xEB, 0x02,             // jmp 0x1004
+            0xFF, 0xFF,             // unreachable invalid encoding
+            0xC3,                   // ret
+        ];
+
+        let function = decode_test_function(&bytes).unwrap();
+
+        assert_eq!(function.bytes, bytes);
+        assert_eq!(instruction_offsets(&function), [0, 4]);
+    }
+
+    fn decode_test_function(bytes: &[u8]) -> Result<FunctionImage> {
+        decode_function(
+            ImageSection {
+                address: 0x1000,
+                data: bytes,
+                kind: SectionKind::Text,
+            },
+            0x1000,
+        )
+    }
+
+    fn instruction_offsets(function: &FunctionImage) -> Vec<u64> {
+        function
+            .instructions
+            .iter()
+            .map(|instruction| instruction.va - function.va)
+            .collect()
     }
 }
