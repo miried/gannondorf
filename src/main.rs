@@ -8,17 +8,25 @@ use unlink::{
 };
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about = "Extract Win32 PE functions into standalone COFF object files.",
+    long_about = "Extract Win32 PE/i386 functions from an executable and write standalone COFF object files.\n\nBy default, unlink discovers functions automatically and writes one object file per discovered function. Use --address when you want to extract exactly one known function by virtual address or RVA.",
+    arg_required_else_help = true,
+    after_help = "Examples:\n  unlink input.exe -o extracted-objects\n  unlink input.exe --address 0x401000 -o sub_00401000.obj\n\nOutput:\n  Without --address, -o/--output is an output directory. If omitted, objects are written to the current directory.\n  With --address, -o/--output is the object file path. If omitted, the symbol name is used."
+)]
 struct Args {
     /// PE32 executable to extract from.
+    #[arg(value_name = "INPUT_EXE")]
     input: PathBuf,
 
     /// Function address to extract, as decimal or 0x-prefixed hex. Omitting this discovers functions automatically.
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "ADDRESS")]
     address: Option<String>,
 
     /// Output object path for --address, or output directory for automatic discovery.
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 }
 

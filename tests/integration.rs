@@ -12,6 +12,47 @@ use serde_json::Value;
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
+fn help_describes_discovery_and_single_function_modes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_unlink"))
+        .arg("--help")
+        .output()
+        .expect("failed to run unlink --help");
+    assert_success("run unlink --help", &output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_contains(&stdout, "Extract Win32 PE/i386 functions");
+    assert_contains(&stdout, "unlink input.exe -o extracted-objects");
+    assert_contains(
+        &stdout,
+        "unlink input.exe --address 0x401000 -o sub_00401000.obj",
+    );
+    assert_contains(
+        &stdout,
+        "Without --address, -o/--output is an output directory",
+    );
+    assert_contains(
+        &stdout,
+        "With --address, -o/--output is the object file path",
+    );
+}
+
+#[test]
+fn missing_args_prints_usage_hints() {
+    let output = Command::new(env!("CARGO_BIN_EXE_unlink"))
+        .output()
+        .expect("failed to run unlink without arguments");
+    let output_text = combined_output(&output);
+
+    assert_contains(&output_text, "Usage: unlink [OPTIONS] <INPUT_EXE>");
+    assert_contains(&output_text, "Examples:");
+    assert_contains(&output_text, "unlink input.exe -o extracted-objects");
+    assert!(
+        !output_text.contains("required arguments were not provided"),
+        "expected missing arguments to print help, got:\n{output_text}"
+    );
+}
+
+#[test]
 fn compiled_basic_fixture_matches_extracted_objects() {
     let build = build_and_extract_fixture("basic.cpp");
     assert_objdiff_matches(
@@ -395,6 +436,21 @@ fn assert_success(context: &str, output: &Output) {
         DisplayStatus(output.status),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn assert_contains(haystack: &str, needle: &str) {
+    assert!(
+        haystack.contains(needle),
+        "expected output to contain `{needle}`, got:\n{haystack}"
     );
 }
 
