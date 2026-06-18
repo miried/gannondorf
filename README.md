@@ -13,3 +13,10 @@ When `--address` is omitted, `unlink` discovers PE32/i386 functions automaticall
 ```sh
 unlink input.exe -o extracted-objects
 ```
+
+## Testing
+
+`cargo test` runs helper-level unit tests plus integration tests that compile the
+sources in `tests/fixtures` with the bundled MSVC compiler under Wine, extract
+objects with `unlink`, and compare the result against the compiler-generated
+COFF object with `tools/objdiff-cli-macos-arm64`.

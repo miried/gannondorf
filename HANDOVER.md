@@ -99,16 +99,19 @@ Observed expected result:
 - Entry object `sub_004010C0.obj` is COFF-i386.
 - Entry object has `.text` relocations for external code and data references.
 
-Unit tests in `src/lib.rs` cover:
+Unit tests in `src/lib.rs` cover pure helpers:
 
 - Address parsing.
-- Extracting `0x401000` with no relocations.
-- Extracting `0x401017` with two absolute relocations.
-- Extracting `0x401035` with one relative call relocation.
-- Discovering entrypoint, direct-call target, and prologue-fallback functions.
-- Extracting discovered functions as COFF-i386 objects.
-- Treating small addresses as RVAs.
-- Erroring on non-executable addresses.
+- Default output naming.
+- RVA-to-VA normalization.
+- Range containment boundaries.
+
+Integration tests in `tests/integration.rs` cover the fixture-level flow:
+
+- Compile source fixtures in `tests/fixtures` with the bundled MSVC compiler through Wine.
+- Use the `unlink` CLI to extract objects from the linked executable.
+- Compare selected extracted functions against the compiler-generated object with `tools/objdiff-cli-macos-arm64`.
+- Cover no-reference functions, absolute data relocations, relative call relocations, conditional branches, loops, nested branches, and VA/RVA address extraction.
 
 ## Known Limits
 
@@ -146,9 +149,8 @@ Unit tests in `src/lib.rs` cover:
    - Extend address-size and relocation handling.
    - Use AMD64 relocation kinds, including `REL32_*` variants where instruction displacement distance requires them.
 
-6. Add integration-style fixture checks.
-   - Generate objects into a temp directory.
-   - Inspect with `object` or `llvm-readobj`.
+6. Broaden integration fixtures further.
+   - Add cases for import thunks, indirect control flow, switch tables, and initialized data once the extractor supports those behaviors.
    - Eventually attempt relinking with MSVC/LLVM tools if available.
 
 ## Useful Files
@@ -156,6 +158,6 @@ Unit tests in `src/lib.rs` cover:
 - `README.md`: original project goal.
 - `src/lib.rs`: extraction logic and tests.
 - `src/main.rs`: CLI.
-- `tests/TEST00.CPP`: source for the PE/object fixture.
-- `tests/TEST00.exe`: PE32 fixture used by tests.
-- `tests/TEST00.obj`: original COFF object fixture for comparison.
+- `tests/fixtures/basic.cpp`: source fixture for no-ref, data-reloc, and call-reloc checks.
+- `tests/fixtures/control_flow.cpp`: source fixture for conditional, loop, and nested-branch checks.
+- `tests/integration.rs`: compiles fixtures, runs `unlink`, and compares with `objdiff`.

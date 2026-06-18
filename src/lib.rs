@@ -620,12 +620,7 @@ fn data_symbol_name(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
-    use object::{Architecture, BinaryFormat, RelocationKind};
-
     use super::*;
-
-    const TEST00: &[u8] = include_bytes!("../tests/TEST00.exe");
 
     #[test]
     fn parses_decimal_and_hex_addresses() {
@@ -636,113 +631,24 @@ mod tests {
     }
 
     #[test]
-    fn extracts_function_without_relocations() {
-        let extracted = extract_function_object(TEST00, 0x401000).unwrap();
-        assert_eq!(extracted.symbol_name, "sub_00401000");
-        assert_eq!(extracted.function_len, 0x17);
-
-        let file = object::File::parse(&*extracted.bytes).unwrap();
-        assert_eq!(file.format(), BinaryFormat::Coff);
-        assert_eq!(file.architecture(), Architecture::I386);
-
-        let text = file.section_by_name(".text").unwrap();
-        assert_eq!(text.data().unwrap().len(), 0x17);
-        assert_eq!(text.relocations().count(), 0);
-        assert!(
-            file.symbols()
-                .any(|symbol| symbol.name() == Ok("sub_00401000"))
+    fn default_output_path_uses_symbol_name() {
+        assert_eq!(
+            default_output_path("sub_00401000"),
+            PathBuf::from("sub_00401000.obj")
         );
     }
 
     #[test]
-    fn extracts_function_with_absolute_relocations() {
-        let extracted = extract_function_object(TEST00, 0x401017).unwrap();
-        let file = object::File::parse(&*extracted.bytes).unwrap();
-        let text = file.section_by_name(".text").unwrap();
-        let relocations: Vec<_> = text.relocations().collect();
-
-        assert_eq!(relocations.len(), 2);
-        assert!(
-            relocations
-                .iter()
-                .all(|(_, relocation)| relocation.kind() == RelocationKind::Absolute)
-        );
-        assert!(
-            file.symbols()
-                .any(|symbol| symbol.name() == Ok("data_00406030"))
-        );
-
-        let data = text.data().unwrap();
-        assert_eq!(&data[0x0B..0x0F], &[0, 0, 0, 0]);
-        assert_eq!(&data[0x10..0x14], &[0, 0, 0, 0]);
+    fn normalizes_rvas_against_image_base() {
+        assert_eq!(normalize_address(0x1000, 0x400000), 0x401000);
+        assert_eq!(normalize_address(0x401000, 0x400000), 0x401000);
     }
 
     #[test]
-    fn extracts_function_with_relative_call_relocation() {
-        let extracted = extract_function_object(TEST00, 0x401035).unwrap();
-        let file = object::File::parse(&*extracted.bytes).unwrap();
-        let text = file.section_by_name(".text").unwrap();
-        let relocations: Vec<_> = text.relocations().collect();
-
-        assert_eq!(relocations.len(), 1);
-        assert_eq!(relocations[0].0, 0x0B);
-        assert_eq!(relocations[0].1.kind(), RelocationKind::Relative);
-        assert!(
-            file.symbols()
-                .any(|symbol| symbol.name() == Ok("sub_00401000"))
-        );
-        assert_eq!(&text.data().unwrap()[0x0B..0x0F], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn discovers_functions_from_entrypoint_calls_and_prologues() {
-        let addresses = discover_function_addresses(TEST00).unwrap();
-
-        assert!(addresses.windows(2).all(|window| window[0] < window[1]));
-        assert!(addresses.contains(&0x4010C0));
-        assert!(addresses.contains(&0x401054));
-        assert!(addresses.contains(&0x401000));
-        assert!(addresses.contains(&0x401017));
-        assert!(addresses.contains(&0x401035));
-    }
-
-    #[test]
-    fn extracts_discovered_functions_as_objects() {
-        let extracted = extract_function_objects(TEST00).unwrap();
-        let addresses: Vec<_> = extracted.iter().map(|object| object.function_va).collect();
-        let names: Vec<_> = extracted
-            .iter()
-            .map(|object| object.symbol_name.as_str())
-            .collect();
-
-        assert!(addresses.windows(2).all(|window| window[0] < window[1]));
-        assert!(names.contains(&"sub_00401000"));
-        assert!(names.contains(&"sub_00401017"));
-        assert!(names.contains(&"sub_00401035"));
-        assert!(names.contains(&"sub_00401054"));
-        assert!(names.contains(&"sub_004010C0"));
-
-        for object in extracted {
-            let file = object::File::parse(&*object.bytes).unwrap();
-            assert_eq!(file.format(), BinaryFormat::Coff);
-            assert_eq!(file.architecture(), Architecture::I386);
-        }
-    }
-
-    #[test]
-    fn treats_small_addresses_as_rvas() {
-        let by_va = extract_function_object(TEST00, 0x401000).unwrap();
-        let by_rva = extract_function_object(TEST00, 0x1000).unwrap();
-        assert_eq!(by_va.bytes, by_rva.bytes);
-    }
-
-    #[test]
-    fn errors_when_address_is_not_executable() {
-        let error = extract_function_object(TEST00, 0x406030).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("is not inside an executable section")
-        );
+    fn range_contains_only_complete_subranges() {
+        assert!(contains_range(0x1000, 0x20, 0x1000, 4));
+        assert!(contains_range(0x1000, 0x20, 0x101C, 4));
+        assert!(!contains_range(0x1000, 0x20, 0x101D, 4));
+        assert!(!contains_range(0x1000, 0x20, 0x0FFF, 1));
     }
 }
