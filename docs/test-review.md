@@ -4,7 +4,7 @@ Date: 2026-06-18
 Scope: `tests/integration.rs`, `tests/fixtures/`
 
 Baseline: all 5 integration tests pass in ~6.7s with the full toolchain
-(wine + bundled MSVC + `tools/objdiff-cli-macos-arm64`) present.
+(wine + bundled MSVC + `tests/tools/objdiff-cli-macos-arm64`) present.
 
 The suite is solid — real end-to-end coverage (compile -> extract -> `objdiff`
 compare), robust `parse_u64`, signal-aware status display, and helpful panic
@@ -15,7 +15,7 @@ messages. Improvements below are ordered by impact.
 ### 1. Toolchain-dependent tests hard-fail instead of skipping
 `integration.rs:134-138`, `integration.rs:230-234`
 `compile_fixture` / `run_objdiff` `assert!`/`panic!` when wine, MSVC, or objdiff
-are absent. `tools/objdiff-cli-macos-arm64` is mac-arm64-only and gitignored, so
+are absent. `tests/tools/objdiff-cli-macos-arm64` is mac-arm64-only and gitignored, so
 plain `cargo test` cannot pass on Linux CI, Intel macs, or any contributor
 checkout without the bundled tools.
 Fix (pick one):

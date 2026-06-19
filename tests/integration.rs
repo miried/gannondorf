@@ -127,13 +127,13 @@ fn compile_fixture(source_name: &str) -> FixtureBuild {
         )
     });
 
-    let tools = project_root.join("tools");
+    let tools = test_tools_dir();
     let compiler = tools.join("MSDEV").join("BIN").join("CL.EXE");
     let include = tools.join("MSDEV").join("INCLUDE");
     let lib = tools.join("MSDEV").join("LIB");
     assert!(
         compiler.exists(),
-        "missing compiler `{}`; see tools/TOOLS.md",
+        "missing compiler `{}`; see tests/tools/TOOLS.md",
         compiler.display()
     );
 
@@ -226,10 +226,10 @@ fn assert_objdiff_symbol_matches(
 }
 
 fn run_objdiff(target_obj: &Path, base_obj: &Path, target_symbol: &str) -> Value {
-    let objdiff = project_root().join("tools").join("objdiff-cli-macos-arm64");
+    let objdiff = test_tools_dir().join("objdiff-cli-macos-arm64");
     assert!(
         objdiff.exists(),
-        "missing objdiff CLI `{}`; see tools/TOOLS.md",
+        "missing objdiff CLI `{}`; see tests/tools/TOOLS.md",
         objdiff.display()
     );
 
@@ -425,6 +425,10 @@ fn new_test_dir(fixture: &str) -> PathBuf {
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn test_tools_dir() -> PathBuf {
+    project_root().join("tests").join("tools")
 }
 
 fn assert_success(context: &str, output: &Output) {

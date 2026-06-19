@@ -15,7 +15,7 @@ The current implementation is an MVP for extracting functions from PE32/i386 ima
 - Only PE32/i386 is supported.
 - Omitting `--address` discovers functions automatically and writes one `sub_XXXXXXXX.obj` per function. In automatic mode, `-o/--output` is an output directory.
 
-Current git status has tracked edits in `HANDOVER.md`, `README.md`, `src/lib.rs`, and `src/main.rs`; `tools/` remains untracked and unrelated to this step.
+Local test tools live under `tests/tools/`.
 
 ## Implemented Behavior
 
@@ -110,7 +110,7 @@ Integration tests in `tests/integration.rs` cover the fixture-level flow:
 
 - Compile source fixtures in `tests/fixtures` with the bundled MSVC compiler through Wine.
 - Use the `unlink` CLI to extract objects from the linked executable.
-- Compare selected extracted functions against the compiler-generated object with `tools/objdiff-cli-macos-arm64`.
+- Compare selected extracted functions against the compiler-generated object with `tests/tools/objdiff-cli-macos-arm64`.
 - Cover no-reference functions, absolute data relocations, relative call relocations, conditional branches, loops, nested branches, and VA/RVA address extraction.
 
 ## Known Limits

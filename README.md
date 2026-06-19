@@ -19,4 +19,4 @@ unlink input.exe -o extracted-objects
 `cargo test` runs helper-level unit tests plus integration tests that compile the
 sources in `tests/fixtures` with the bundled MSVC compiler under Wine, extract
 objects with `unlink`, and compare the result against the compiler-generated
-COFF object with `tools/objdiff-cli-macos-arm64`.
+COFF object with `tests/tools/objdiff-cli-macos-arm64`.
