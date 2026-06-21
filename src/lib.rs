@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter};
 use object::pe;
 use object::read::pe::PeFile32;
 use object::read::{Object, ObjectSection};
@@ -43,6 +43,21 @@ pub struct ExtractedObject {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredFunction {
+    pub symbol_name: String,
+    pub function_va: u64,
+    pub function_len: u64,
+    pub instructions: Vec<DisassembledInstruction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisassembledInstruction {
+    pub va: u64,
+    pub len: u32,
+    pub text: String,
+}
+
 #[derive(Debug)]
 struct PeI386Image<'data> {
     image_base: u64,
@@ -68,6 +83,7 @@ struct FunctionImage {
 #[derive(Debug, Clone)]
 struct DecodedInstruction {
     va: u64,
+    len: u32,
     branch: Option<BranchReference>,
 }
 
@@ -113,6 +129,14 @@ pub fn extract_function_object(image: &[u8], requested_address: u64) -> Result<E
 pub fn discover_function_addresses(image: &[u8]) -> Result<Vec<u64>> {
     let image = PeI386Image::parse(image)?;
     Ok(discover_function_images(&image)?.keys().copied().collect())
+}
+
+pub fn discover_functions(image: &[u8]) -> Result<Vec<DiscoveredFunction>> {
+    let image = PeI386Image::parse(image)?;
+    Ok(discover_function_images(&image)?
+        .values()
+        .map(describe_discovered_function)
+        .collect())
 }
 
 pub fn extract_function_objects(image: &[u8]) -> Result<Vec<ExtractedObject>> {
@@ -175,6 +199,55 @@ fn write_extracted_object(
         function_len: function.bytes.len() as u64,
         bytes,
     })
+}
+
+fn describe_discovered_function(function: &FunctionImage) -> DiscoveredFunction {
+    DiscoveredFunction {
+        symbol_name: code_symbol_name(function.va),
+        function_va: function.va,
+        function_len: function.bytes.len() as u64,
+        instructions: function
+            .instructions
+            .iter()
+            .map(|instruction| DisassembledInstruction {
+                va: instruction.va,
+                len: instruction.len,
+                text: format_instruction(function, instruction),
+            })
+            .collect(),
+    }
+}
+
+fn format_instruction(function: &FunctionImage, instruction: &DecodedInstruction) -> String {
+    let offset = instruction
+        .va
+        .checked_sub(function.va)
+        .expect("decoded instruction precedes function start") as usize;
+    let end = offset
+        .checked_add(instruction.len as usize)
+        .expect("decoded instruction length overflowed");
+    let bytes = function
+        .bytes
+        .get(offset..end)
+        .expect("decoded instruction bytes were captured in function image");
+    let mut decoder = Decoder::with_ip(32, bytes, instruction.va, DecoderOptions::NONE);
+    let decoded = decoder.decode();
+    format_iced_instruction(&decoded)
+}
+
+fn format_iced_instruction(instruction: &Instruction) -> String {
+    let mut formatter = IntelFormatter::new();
+    let options = formatter.options_mut();
+    options.set_uppercase_hex(false);
+    options.set_hex_prefix("0x");
+    options.set_hex_suffix("");
+    options.set_uppercase_mnemonics(true);
+    options.set_uppercase_registers(true);
+    options.set_space_after_operand_separator(true);
+
+    let mut output = String::new();
+    formatter.format(instruction, &mut output);
+    output
 }
 
 fn discover_function_images(image: &PeI386Image<'_>) -> Result<BTreeMap<u64, FunctionImage>> {
@@ -492,6 +565,7 @@ fn decode_reachable_instruction(
     Ok((
         DecodedInstruction {
             va: instruction.ip(),
+            len: instruction_len as u32,
             branch,
         },
         flow_control,

@@ -1,4 +1,6 @@
 /target
+tests/bin/
 tests/tools/MSDEV/
+tests/tools/functions.json
+tests/tools/ghidra/
 tests/tools/objdiff-cli-macos-arm64
-

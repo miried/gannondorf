@@ -1,15 +1,107 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use iced_x86::{Decoder, DecoderOptions};
 use object::SymbolKind;
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use serde_json::Value;
+use unlink::discover_functions;
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();
+
+// Current scanner/Ghidra function-boundary disagreements, plus x87 wait-prefix
+// grouping differences where Ghidra emits one instruction and iced-x86 emits
+// WAIT/FWAIT plus the following x87 instruction.
+macro_rules! ti_known_disassembly_differences {
+    ($visit:ident) => {
+        $visit! {
+            (ti_known_diff_00402ef0_matches_ghidra, 0x00402EF0),
+            (ti_known_diff_00405c50_matches_ghidra, 0x00405C50),
+            (ti_known_diff_00406150_matches_ghidra, 0x00406150),
+            (ti_known_diff_004061e0_matches_ghidra, 0x004061E0),
+            (ti_known_diff_0040b370_matches_ghidra, 0x0040B370),
+            (ti_known_diff_0040bb60_matches_ghidra, 0x0040BB60),
+            (ti_known_diff_0040beb0_matches_ghidra, 0x0040BEB0),
+            (ti_known_diff_0040cd50_matches_ghidra, 0x0040CD50),
+            (ti_known_diff_0040f260_matches_ghidra, 0x0040F260),
+            (ti_known_diff_00412260_matches_ghidra, 0x00412260),
+            (ti_known_diff_00417450_matches_ghidra, 0x00417450),
+            (ti_known_diff_0041a2c0_matches_ghidra, 0x0041A2C0),
+            (ti_known_diff_0041a450_matches_ghidra, 0x0041A450),
+            (ti_known_diff_0041bb40_matches_ghidra, 0x0041BB40),
+            (ti_known_diff_0041e090_matches_ghidra, 0x0041E090),
+            (ti_known_diff_0041ec10_matches_ghidra, 0x0041EC10),
+            (ti_known_diff_00425400_matches_ghidra, 0x00425400),
+            (ti_known_diff_00426f40_matches_ghidra, 0x00426F40),
+            (ti_known_diff_00427050_matches_ghidra, 0x00427050),
+            (ti_known_diff_00428d90_matches_ghidra, 0x00428D90),
+            (ti_known_diff_00428e70_matches_ghidra, 0x00428E70),
+            (ti_known_diff_00429b70_matches_ghidra, 0x00429B70),
+            (ti_known_diff_0042b8a0_matches_ghidra, 0x0042B8A0),
+            (ti_known_diff_004316e0_matches_ghidra, 0x004316E0),
+            (ti_known_diff_00431de0_matches_ghidra, 0x00431DE0),
+            (ti_known_diff_00438a10_matches_ghidra, 0x00438A10),
+            (ti_known_diff_00438c90_matches_ghidra, 0x00438C90),
+            (ti_known_diff_00439700_matches_ghidra, 0x00439700),
+            (ti_known_diff_0043b000_matches_ghidra, 0x0043B000),
+            (ti_known_diff_0043c2c0_matches_ghidra, 0x0043C2C0),
+            (ti_known_diff_0043df60_matches_ghidra, 0x0043DF60),
+            (ti_known_diff_00442670_matches_ghidra, 0x00442670),
+            (ti_known_diff_00443730_matches_ghidra, 0x00443730),
+            (ti_known_diff_00444620_matches_ghidra, 0x00444620),
+            (ti_known_diff_00447640_matches_ghidra, 0x00447640),
+            (ti_known_diff_00449310_matches_ghidra, 0x00449310),
+            (ti_known_diff_0044a000_matches_ghidra, 0x0044A000),
+            (ti_known_diff_0044aab0_matches_ghidra, 0x0044AAB0),
+            (ti_known_diff_0044e3a0_matches_ghidra, 0x0044E3A0),
+            (ti_known_diff_0044e440_matches_ghidra, 0x0044E440),
+            (ti_known_diff_0044e652_matches_ghidra, 0x0044E652),
+            (ti_known_diff_0045000e_matches_ghidra, 0x0045000E),
+            (ti_known_diff_0045004b_matches_ghidra, 0x0045004B),
+            (ti_known_diff_00450093_matches_ghidra, 0x00450093),
+            (ti_known_diff_004501cb_matches_ghidra, 0x004501CB),
+            (ti_known_diff_004504b0_matches_ghidra, 0x004504B0),
+            (ti_known_diff_00452750_matches_ghidra, 0x00452750),
+            (ti_known_diff_00452c10_matches_ghidra, 0x00452C10),
+            (ti_known_diff_00453db0_matches_ghidra, 0x00453DB0),
+            (ti_known_diff_00453e17_matches_ghidra, 0x00453E17),
+            (ti_known_diff_00454fe0_matches_ghidra, 0x00454FE0),
+            (ti_known_diff_00455d80_matches_ghidra, 0x00455D80),
+            (ti_known_diff_00456ea0_matches_ghidra, 0x00456EA0),
+            (ti_known_diff_00457510_matches_ghidra, 0x00457510),
+            (ti_known_diff_00457550_matches_ghidra, 0x00457550),
+            (ti_known_diff_00457590_matches_ghidra, 0x00457590),
+        }
+    };
+}
+
+macro_rules! define_known_ti_difference_addresses {
+    ($(($name:ident, $address:expr)),+ $(,)?) => {
+        const KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES: &[u64] = &[$($address),+];
+    };
+}
+
+macro_rules! define_known_ti_difference_tests {
+    ($(($name:ident, $address:expr)),+ $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "known TI/Ghidra disassembly byte-stream difference"]
+            fn $name() {
+                assert_ti_function_disassembly_matches_ghidra($address);
+            }
+        )+
+    };
+}
+
+ti_known_disassembly_differences!(define_known_ti_difference_addresses);
+ti_known_disassembly_differences!(define_known_ti_difference_tests);
 
 #[test]
 fn help_describes_discovery_and_single_function_modes() {
@@ -92,6 +184,66 @@ fn single_function_extraction_accepts_va_and_rva() {
     let rva_output = build.dir.join("single-rva.obj");
     run_unlink_address(&build.exe, rva, &rva_output);
     assert_objdiff_symbol_matches(&rva_output, &build.obj, &format_code_symbol(va), symbol);
+}
+
+#[test]
+#[ignore = "tracking scanner/Ghidra function-set parity while discovery is being hardened"]
+fn ti_function_discovery_matches_ghidra_export() {
+    let comparison = ti_function_comparison();
+
+    assert!(
+        comparison.scanner_only.is_empty() && comparison.ghidra_only.is_empty(),
+        "unlink and Ghidra found different function sets in TI.EXE\n\
+         common: {}\n\
+         unlink only ({}): {}\n\
+         Ghidra only ({}): {}",
+        comparison.common.len(),
+        comparison.scanner_only.len(),
+        format_address_list(&comparison.scanner_only),
+        comparison.ghidra_only.len(),
+        format_address_list(&comparison.ghidra_only)
+    );
+}
+
+#[test]
+fn ti_common_function_disassembly_matches_ghidra_export() {
+    let comparison = ti_function_comparison();
+    let mut mismatches = Vec::new();
+    let mut known_mismatches = BTreeSet::new();
+
+    for address in &comparison.common {
+        let scanner = comparison
+            .scanner_functions
+            .get(address)
+            .expect("common function missing from scanner map");
+        let ghidra = comparison
+            .ghidra_functions
+            .get(address)
+            .expect("common function missing from Ghidra map");
+
+        if ti_instruction_byte_stream(scanner) != ti_instruction_byte_stream(ghidra) {
+            if KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES.contains(address) {
+                known_mismatches.insert(*address);
+            } else {
+                mismatches.push(format_ti_disassembly_mismatch(*address, scanner, ghidra));
+            }
+        }
+    }
+
+    let resolved_known_mismatches = KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES
+        .iter()
+        .copied()
+        .filter(|address| !known_mismatches.contains(address))
+        .collect::<Vec<_>>();
+
+    assert!(
+        mismatches.is_empty() && resolved_known_mismatches.is_empty(),
+        "unlink and Ghidra instruction bytes differed unexpectedly for {} common TI.EXE function(s)\n\
+         resolved known mismatch(es): {}\n\n{}",
+        mismatches.len(),
+        format_address_list(&resolved_known_mismatches),
+        mismatches.join("\n\n")
+    );
 }
 
 struct FixtureBuild {
@@ -399,6 +551,358 @@ fn parse_u64(value: &Value) -> u64 {
         .unwrap_or_else(|| panic!("expected integer string or number, got `{value}`"))
         .parse()
         .unwrap_or_else(|err| panic!("failed to parse integer `{value}`: {err}"))
+}
+
+#[derive(Debug)]
+struct TiFunctionComparison {
+    scanner_functions: BTreeMap<u64, Vec<TiInstruction>>,
+    ghidra_functions: BTreeMap<u64, Vec<TiInstruction>>,
+    common: Vec<u64>,
+    scanner_only: Vec<u64>,
+    ghidra_only: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct TiInstruction {
+    va: u64,
+    bytes: Vec<u8>,
+    text: String,
+}
+
+#[derive(Debug)]
+struct TiImage {
+    file_bytes: Vec<u8>,
+    sections: Vec<TiImageSection>,
+}
+
+#[derive(Debug)]
+struct TiImageSection {
+    va: u64,
+    bytes: Vec<u8>,
+}
+
+impl TiImage {
+    fn bytes_at(&self, va: u64, len: usize) -> Vec<u8> {
+        let section = self
+            .section_containing(va)
+            .unwrap_or_else(|| panic!("0x{va:08X} is outside TI.EXE sections"));
+        let offset = va
+            .checked_sub(section.va)
+            .expect("section lookup returned a section after the requested VA")
+            as usize;
+        section
+            .bytes
+            .get(offset..offset + len)
+            .unwrap_or_else(|| panic!("0x{va:08X}+0x{len:X} is outside TI.EXE section bytes"))
+            .to_vec()
+    }
+
+    fn decode_instruction_len_at(&self, va: u64) -> usize {
+        let section = self
+            .section_containing(va)
+            .unwrap_or_else(|| panic!("0x{va:08X} is outside TI.EXE sections"));
+        let offset = va
+            .checked_sub(section.va)
+            .expect("section lookup returned a section after the requested VA")
+            as usize;
+        let bytes = section
+            .bytes
+            .get(offset..)
+            .unwrap_or_else(|| panic!("0x{va:08X} is outside TI.EXE section bytes"));
+        let mut decoder = Decoder::with_ip(32, bytes, va, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        assert!(
+            !instruction.is_invalid() && instruction.len() > 0,
+            "failed to decode instruction length at 0x{va:08X}"
+        );
+        instruction.len()
+    }
+
+    fn section_containing(&self, va: u64) -> Option<&TiImageSection> {
+        self.sections.iter().find(|section| {
+            va >= section.va && va < section.va.saturating_add(section.bytes.len() as u64)
+        })
+    }
+}
+
+fn load_ti_function_comparison() -> TiFunctionComparison {
+    let image = load_ti_image();
+    let scanner_functions = load_ti_scanner_functions(&image);
+    let ghidra_functions = load_ti_ghidra_functions(&image);
+
+    let scanner_addresses = scanner_functions.keys().copied().collect::<BTreeSet<_>>();
+    let ghidra_addresses = ghidra_functions.keys().copied().collect::<BTreeSet<_>>();
+    let common = scanner_addresses
+        .intersection(&ghidra_addresses)
+        .copied()
+        .collect();
+    let scanner_only = scanner_addresses
+        .difference(&ghidra_addresses)
+        .copied()
+        .collect();
+    let ghidra_only = ghidra_addresses
+        .difference(&scanner_addresses)
+        .copied()
+        .collect();
+
+    TiFunctionComparison {
+        scanner_functions,
+        ghidra_functions,
+        common,
+        scanner_only,
+        ghidra_only,
+    }
+}
+
+fn ti_function_comparison() -> &'static TiFunctionComparison {
+    TI_FUNCTION_COMPARISON.get_or_init(load_ti_function_comparison)
+}
+
+fn assert_ti_function_disassembly_matches_ghidra(address: u64) {
+    let comparison = ti_function_comparison();
+    let scanner = comparison
+        .scanner_functions
+        .get(&address)
+        .unwrap_or_else(|| panic!("unlink did not discover 0x{address:08X}"));
+    let ghidra = comparison
+        .ghidra_functions
+        .get(&address)
+        .unwrap_or_else(|| panic!("Ghidra export does not contain 0x{address:08X}"));
+
+    assert!(
+        ti_instruction_byte_stream(scanner) == ti_instruction_byte_stream(ghidra),
+        "known TI/Ghidra disassembly byte-stream difference is not fixed yet\n\n{}",
+        format_ti_disassembly_mismatch(address, scanner, ghidra)
+    );
+}
+
+fn load_ti_image() -> TiImage {
+    let exe = project_root().join("tests").join("bin").join("TI.EXE");
+    assert!(
+        exe.exists(),
+        "missing test binary `{}`; see tests/tools/TOOLS.md",
+        exe.display()
+    );
+    let file_bytes =
+        fs::read(&exe).unwrap_or_else(|err| panic!("failed to read `{}`: {err}", exe.display()));
+    let file = object::File::parse(&*file_bytes)
+        .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", exe.display()));
+    let sections = file
+        .sections()
+        .map(|section| TiImageSection {
+            va: section.address(),
+            bytes: section
+                .data()
+                .unwrap_or_else(|err| panic!("failed to read section data from TI.EXE: {err}"))
+                .to_vec(),
+        })
+        .collect();
+
+    TiImage {
+        file_bytes,
+        sections,
+    }
+}
+
+fn load_ti_scanner_functions(image: &TiImage) -> BTreeMap<u64, Vec<TiInstruction>> {
+    discover_functions(&image.file_bytes)
+        .unwrap_or_else(|err| panic!("failed to discover functions in TI.EXE: {err}"))
+        .into_iter()
+        .map(|function| {
+            (
+                function.function_va,
+                function
+                    .instructions
+                    .into_iter()
+                    .map(|instruction| TiInstruction {
+                        va: instruction.va,
+                        bytes: image.bytes_at(instruction.va, instruction.len as usize),
+                        text: instruction.text,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn load_ti_ghidra_functions(image: &TiImage) -> BTreeMap<u64, Vec<TiInstruction>> {
+    let path = project_root()
+        .join("tests")
+        .join("tools")
+        .join("functions.json");
+    assert!(
+        path.exists(),
+        "missing Ghidra export `{}`; run tests/tools/export_functions.py",
+        path.display()
+    );
+    let data =
+        fs::read(&path).unwrap_or_else(|err| panic!("failed to read `{}`: {err}", path.display()));
+    let export: Value = serde_json::from_slice(&data)
+        .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", path.display()));
+    assert_eq!(
+        export["binary_file"].as_str(),
+        Some("TI.EXE"),
+        "`{}` was not exported from TI.EXE",
+        path.display()
+    );
+
+    export["functions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`{}` has no functions array", path.display()))
+        .iter()
+        .map(|function| {
+            let address = parse_hex_address(
+                function["address"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("Ghidra function has no address: {function}")),
+            );
+            (address, parse_ghidra_function(image, address, function))
+        })
+        .collect()
+}
+
+fn parse_ghidra_function(
+    image: &TiImage,
+    function_va: u64,
+    function: &Value,
+) -> Vec<TiInstruction> {
+    if let Some(instructions) = function["instructions"].as_array()
+        && !instructions.is_empty()
+    {
+        return instructions
+            .iter()
+            .map(|instruction| {
+                let address = instruction["address"].as_str().unwrap_or_else(|| {
+                    panic!("Ghidra function 0x{function_va:08X} has an instruction with no address")
+                });
+                let bytes = instruction["bytes"].as_str().unwrap_or_else(|| {
+                    panic!("Ghidra instruction `{instruction}` has no byte string")
+                });
+                TiInstruction {
+                    va: parse_hex_address(address),
+                    bytes: parse_hex_bytes(bytes),
+                    text: instruction["text"].as_str().unwrap_or("").to_owned(),
+                }
+            })
+            .collect();
+    }
+
+    let disassembly = function["disassembly"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Ghidra function 0x{function_va:08X} has no disassembly"));
+    let mut instructions = disassembly
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (address, text) = line.split_once(' ').unwrap_or_else(|| {
+                panic!("malformed Ghidra disassembly line for 0x{function_va:08X}: `{line}`")
+            });
+            TiInstruction {
+                va: parse_hex_address(address),
+                bytes: Vec::new(),
+                text: text.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    for index in 0..instructions.len() {
+        let va = instructions[index].va;
+        let len = image.decode_instruction_len_at(va);
+        instructions[index].bytes = image.bytes_at(va, len);
+    }
+    instructions
+}
+
+fn ti_instruction_byte_stream(instructions: &[TiInstruction]) -> Vec<(u64, Vec<u8>)> {
+    instructions
+        .iter()
+        .map(|instruction| (instruction.va, instruction.bytes.clone()))
+        .collect()
+}
+
+fn format_ti_disassembly_mismatch(
+    address: u64,
+    scanner: &[TiInstruction],
+    ghidra: &[TiInstruction],
+) -> String {
+    let scanner_bytes = ti_instruction_byte_stream(scanner);
+    let ghidra_bytes = ti_instruction_byte_stream(ghidra);
+    let first_difference = scanner_bytes
+        .iter()
+        .zip(&ghidra_bytes)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| scanner_bytes.len().min(ghidra_bytes.len()));
+
+    format!(
+        "0x{address:08X}: unlink {} instruction(s), Ghidra {} instruction(s), first difference at instruction {}\n\
+         unlink: {}\n\
+         Ghidra: {}",
+        scanner.len(),
+        ghidra.len(),
+        first_difference,
+        scanner
+            .get(first_difference)
+            .map(format_ti_instruction)
+            .unwrap_or_else(|| "<end of function>".to_owned()),
+        ghidra
+            .get(first_difference)
+            .map(format_ti_instruction)
+            .unwrap_or_else(|| "<end of function>".to_owned())
+    )
+}
+
+fn format_ti_instruction(instruction: &TiInstruction) -> String {
+    format!(
+        "0x{:08X} {:<24} {}",
+        instruction.va,
+        format_hex_bytes(&instruction.bytes),
+        instruction.text
+    )
+}
+
+fn parse_hex_address(input: &str) -> u64 {
+    let digits = input
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| input.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| input.trim());
+    u64::from_str_radix(digits, 16)
+        .unwrap_or_else(|err| panic!("failed to parse hex address `{input}`: {err}"))
+}
+
+fn parse_hex_bytes(input: &str) -> Vec<u8> {
+    assert!(
+        input.len() % 2 == 0,
+        "hex byte string has odd length: `{input}`"
+    );
+    (0..input.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&input[index..index + 2], 16)
+                .unwrap_or_else(|err| panic!("failed to parse hex byte `{input}`: {err}"))
+        })
+        .collect()
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_address_list(addresses: &[u64]) -> String {
+    const LIMIT: usize = 80;
+
+    let mut values = addresses
+        .iter()
+        .take(LIMIT)
+        .map(|address| format!("0x{address:08X}"))
+        .collect::<Vec<_>>();
+    if addresses.len() > LIMIT {
+        values.push(format!("... and {} more", addresses.len() - LIMIT));
+    }
+    values.join(", ")
 }
 
 fn format_code_symbol(va: u64) -> String {
