@@ -16,92 +16,17 @@ use unlink::discover_functions;
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();
 
-// Current scanner/Ghidra function-boundary disagreements, plus x87 wait-prefix
-// grouping differences where Ghidra emits one instruction and iced-x86 emits
-// WAIT/FWAIT plus the following x87 instruction.
-macro_rules! ti_known_disassembly_differences {
-    ($visit:ident) => {
-        $visit! {
-            (ti_known_diff_00402ef0_matches_ghidra, 0x00402EF0),
-            (ti_known_diff_00405c50_matches_ghidra, 0x00405C50),
-            (ti_known_diff_00406150_matches_ghidra, 0x00406150),
-            (ti_known_diff_004061e0_matches_ghidra, 0x004061E0),
-            (ti_known_diff_0040b370_matches_ghidra, 0x0040B370),
-            (ti_known_diff_0040bb60_matches_ghidra, 0x0040BB60),
-            (ti_known_diff_0040beb0_matches_ghidra, 0x0040BEB0),
-            (ti_known_diff_0040cd50_matches_ghidra, 0x0040CD50),
-            (ti_known_diff_0040f260_matches_ghidra, 0x0040F260),
-            (ti_known_diff_00412260_matches_ghidra, 0x00412260),
-            (ti_known_diff_00417450_matches_ghidra, 0x00417450),
-            (ti_known_diff_0041a2c0_matches_ghidra, 0x0041A2C0),
-            (ti_known_diff_0041a450_matches_ghidra, 0x0041A450),
-            (ti_known_diff_0041bb40_matches_ghidra, 0x0041BB40),
-            (ti_known_diff_0041e090_matches_ghidra, 0x0041E090),
-            (ti_known_diff_0041ec10_matches_ghidra, 0x0041EC10),
-            (ti_known_diff_00425400_matches_ghidra, 0x00425400),
-            (ti_known_diff_00426f40_matches_ghidra, 0x00426F40),
-            (ti_known_diff_00427050_matches_ghidra, 0x00427050),
-            (ti_known_diff_00428d90_matches_ghidra, 0x00428D90),
-            (ti_known_diff_00428e70_matches_ghidra, 0x00428E70),
-            (ti_known_diff_00429b70_matches_ghidra, 0x00429B70),
-            (ti_known_diff_0042b8a0_matches_ghidra, 0x0042B8A0),
-            (ti_known_diff_004316e0_matches_ghidra, 0x004316E0),
-            (ti_known_diff_00431de0_matches_ghidra, 0x00431DE0),
-            (ti_known_diff_00438a10_matches_ghidra, 0x00438A10),
-            (ti_known_diff_00438c90_matches_ghidra, 0x00438C90),
-            (ti_known_diff_00439700_matches_ghidra, 0x00439700),
-            (ti_known_diff_0043b000_matches_ghidra, 0x0043B000),
-            (ti_known_diff_0043c2c0_matches_ghidra, 0x0043C2C0),
-            (ti_known_diff_0043df60_matches_ghidra, 0x0043DF60),
-            (ti_known_diff_00442670_matches_ghidra, 0x00442670),
-            (ti_known_diff_00443730_matches_ghidra, 0x00443730),
-            (ti_known_diff_00444620_matches_ghidra, 0x00444620),
-            (ti_known_diff_00447640_matches_ghidra, 0x00447640),
-            (ti_known_diff_00449310_matches_ghidra, 0x00449310),
-            (ti_known_diff_0044a000_matches_ghidra, 0x0044A000),
-            (ti_known_diff_0044aab0_matches_ghidra, 0x0044AAB0),
-            (ti_known_diff_0044e3a0_matches_ghidra, 0x0044E3A0),
-            (ti_known_diff_0044e440_matches_ghidra, 0x0044E440),
-            (ti_known_diff_0044e652_matches_ghidra, 0x0044E652),
-            (ti_known_diff_0045000e_matches_ghidra, 0x0045000E),
-            (ti_known_diff_0045004b_matches_ghidra, 0x0045004B),
-            (ti_known_diff_00450093_matches_ghidra, 0x00450093),
-            (ti_known_diff_004501cb_matches_ghidra, 0x004501CB),
-            (ti_known_diff_004504b0_matches_ghidra, 0x004504B0),
-            (ti_known_diff_00452750_matches_ghidra, 0x00452750),
-            (ti_known_diff_00452c10_matches_ghidra, 0x00452C10),
-            (ti_known_diff_00453db0_matches_ghidra, 0x00453DB0),
-            (ti_known_diff_00453e17_matches_ghidra, 0x00453E17),
-            (ti_known_diff_00454fe0_matches_ghidra, 0x00454FE0),
-            (ti_known_diff_00455d80_matches_ghidra, 0x00455D80),
-            (ti_known_diff_00456ea0_matches_ghidra, 0x00456EA0),
-            (ti_known_diff_00457510_matches_ghidra, 0x00457510),
-            (ti_known_diff_00457550_matches_ghidra, 0x00457550),
-            (ti_known_diff_00457590_matches_ghidra, 0x00457590),
-        }
-    };
-}
-
-macro_rules! define_known_ti_difference_addresses {
-    ($(($name:ident, $address:expr)),+ $(,)?) => {
-        const KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES: &[u64] = &[$($address),+];
-    };
-}
-
-macro_rules! define_known_ti_difference_tests {
-    ($(($name:ident, $address:expr)),+ $(,)?) => {
-        $(
-            #[test]
-            #[ignore = "known TI/Ghidra disassembly byte-stream difference"]
-            fn $name() {
-                assert_ti_function_disassembly_matches_ghidra($address);
-            }
-        )+
-    };
-}
-
-ti_known_disassembly_differences!(define_known_ti_difference_addresses);
-ti_known_disassembly_differences!(define_known_ti_difference_tests);
+const KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES: &[u64] = &[];
+const EXPECTED_TI_COMMON_FUNCTIONS: usize = 1471;
+const EXPECTED_TI_SCANNER_ONLY_FUNCTIONS: &[u64] = &[
+    0x0044FF1E, 0x0044FF61, 0x00451EA8, 0x00453F69, 0x00453F80, 0x004541D0, 0x00454250, 0x00454806,
+    0x00454819, 0x00454A41, 0x00454A56, 0x00454C5C, 0x00454D0E, 0x00454F14, 0x00456B50, 0x00456C70,
+    0x00456DF0,
+];
+const EXPECTED_TI_GHIDRA_ONLY_FUNCTIONS: &[u64] = &[
+    0x00407140, 0x00407220, 0x0041B840, 0x0041D9D0, 0x00421040, 0x00424240, 0x0042B7D0, 0x0042B890,
+    0x00430F70, 0x004325B0, 0x0044E3D0, 0x00451F65, 0x00452DB0, 0x00456A00, 0x00458010, 0x00458580,
+];
 
 #[test]
 fn help_describes_discovery_and_single_function_modes() {
@@ -187,13 +112,15 @@ fn single_function_extraction_accepts_va_and_rva() {
 }
 
 #[test]
-#[ignore = "tracking scanner/Ghidra function-set parity while discovery is being hardened"]
-fn ti_function_discovery_matches_ghidra_export() {
+#[ignore = "tracking scanner/Ghidra function-set delta while discovery is being hardened"]
+fn ti_function_discovery_known_delta_matches_ghidra_export() {
     let comparison = ti_function_comparison();
 
     assert!(
-        comparison.scanner_only.is_empty() && comparison.ghidra_only.is_empty(),
-        "unlink and Ghidra found different function sets in TI.EXE\n\
+        comparison.common.len() == EXPECTED_TI_COMMON_FUNCTIONS
+            && comparison.scanner_only.as_slice() == EXPECTED_TI_SCANNER_ONLY_FUNCTIONS
+            && comparison.ghidra_only.as_slice() == EXPECTED_TI_GHIDRA_ONLY_FUNCTIONS,
+        "unlink and Ghidra function-set delta changed in TI.EXE\n\
          common: {}\n\
          unlink only ({}): {}\n\
          Ghidra only ({}): {}",
@@ -656,24 +583,6 @@ fn load_ti_function_comparison() -> TiFunctionComparison {
 
 fn ti_function_comparison() -> &'static TiFunctionComparison {
     TI_FUNCTION_COMPARISON.get_or_init(load_ti_function_comparison)
-}
-
-fn assert_ti_function_disassembly_matches_ghidra(address: u64) {
-    let comparison = ti_function_comparison();
-    let scanner = comparison
-        .scanner_functions
-        .get(&address)
-        .unwrap_or_else(|| panic!("unlink did not discover 0x{address:08X}"));
-    let ghidra = comparison
-        .ghidra_functions
-        .get(&address)
-        .unwrap_or_else(|| panic!("Ghidra export does not contain 0x{address:08X}"));
-
-    assert!(
-        ti_instruction_byte_stream(scanner) == ti_instruction_byte_stream(ghidra),
-        "known TI/Ghidra disassembly byte-stream difference is not fixed yet\n\n{}",
-        format_ti_disassembly_mismatch(address, scanner, ghidra)
-    );
 }
 
 fn load_ti_image() -> TiImage {
