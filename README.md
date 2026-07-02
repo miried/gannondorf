@@ -17,12 +17,13 @@ unlink input.exe -o extracted-objects
 To extract PE resources into an MSVC resource script:
 
 ```sh
-unres input.exe -o resources.rc
+unres input.exe
 ```
 
 `unres` writes the `.rc` file plus sidecar assets for binary resources such as
 icons, cursors, and raw resource data. By default, sidecar files are written next
-to the script in a `<script-stem>_resources` directory.
+to the script in a `resources` directory, and the script is written as
+`resources.rc`.
 
 ## Testing
 

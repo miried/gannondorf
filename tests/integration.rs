@@ -79,8 +79,8 @@ fn missing_args_prints_usage_hints() {
 #[test]
 fn unres_extracts_resources_to_msvc_resource_script() {
     let build = compile_resource_fixture();
-    let generated_rc = build.dir.join("generated.rc");
-    run_unres(&build.exe, &generated_rc);
+    let generated_rc = build.dir.join("resources.rc");
+    run_unres_default(&build.exe, &build.dir);
 
     let generated_text = fs::read_to_string(&generated_rc)
         .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", generated_rc.display()));
@@ -90,31 +90,23 @@ fn unres_extracts_resources_to_msvc_resource_script() {
     assert_contains(&generated_text, "17 \"Second block\"");
     assert_contains(
         &generated_text,
-        "1 ICON \"generated_resources/icon_id_0001_lang_0409.ico\"",
+        "1 ICON \"resources/icon_id_0001_lang_0409.ico\"",
     );
     assert_contains(
         &generated_text,
-        "2 CURSOR \"generated_resources/cursor_id_0002_lang_0409.cur\"",
+        "2 CURSOR \"resources/cursor_id_0002_lang_0409.cur\"",
     );
     assert_contains(
         &generated_text,
-        "102 200 \"generated_resources/resource_type_id_00C8_name_id_0066_lang_0409.bin\"",
+        "102 200 \"resources/resource_type_id_00C8_name_id_0066_lang_0409.bin\"",
     );
 
+    assert_nonempty_file(&build.dir.join("resources/icon_id_0001_lang_0409.ico"));
+    assert_nonempty_file(&build.dir.join("resources/cursor_id_0002_lang_0409.cur"));
     assert_nonempty_file(
         &build
             .dir
-            .join("generated_resources/icon_id_0001_lang_0409.ico"),
-    );
-    assert_nonempty_file(
-        &build
-            .dir
-            .join("generated_resources/cursor_id_0002_lang_0409.cur"),
-    );
-    assert_nonempty_file(
-        &build
-            .dir
-            .join("generated_resources/resource_type_id_00C8_name_id_0066_lang_0409.bin"),
+            .join("resources/resource_type_id_00C8_name_id_0066_lang_0409.bin"),
     );
     run_resource_compiler(&generated_rc);
 }
@@ -465,6 +457,15 @@ fn run_unres(exe: &Path, output_rc: &Path) {
         .arg(exe)
         .arg("-o")
         .arg(output_rc)
+        .output()
+        .expect("failed to run unres");
+    assert_success("run unres resource extraction", &output);
+}
+
+fn run_unres_default(exe: &Path, current_dir: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_unres"))
+        .current_dir(current_dir)
+        .arg(exe)
         .output()
         .expect("failed to run unres");
     assert_success("run unres resource extraction", &output);
