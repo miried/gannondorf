@@ -9,6 +9,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iced_x86::{Decoder, DecoderOptions};
 use object::SymbolKind;
+use object::endian::LittleEndian as LE;
+use object::pe;
+use object::read::FileKind;
+use object::read::pe::{
+    ImageNtHeaders, PeFile, PeFile32, PeFile64, ResourceDirectory, ResourceDirectoryEntryData,
+    ResourceDirectoryTable, ResourceNameOrId,
+};
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use serde_json::Value;
 use unlink::discover_functions;
@@ -110,6 +117,18 @@ fn unres_extracts_resources_to_msvc_resource_script() {
             .join("generated_resources/resource_type_id_00C8_name_id_0066_lang_0409.bin"),
     );
     run_resource_compiler(&generated_rc);
+}
+
+#[test]
+fn ti_resources_roundtrip_through_unres_and_msvc() {
+    let input_exe = ti_exe_path();
+    let dir = new_test_dir("ti-resources");
+    let generated_rc = dir.join("ti.rc");
+    run_unres(&input_exe, &generated_rc);
+
+    let rebuilt_exe = compile_empty_winmain_resource_app(&generated_rc);
+
+    assert_resource_fingerprints_match(&input_exe, &rebuilt_exe);
 }
 
 #[test]
@@ -313,6 +332,56 @@ fn compile_resource_fixture() -> ResourceFixtureBuild {
     ResourceFixtureBuild { dir, exe }
 }
 
+fn compile_empty_winmain_resource_app(resource_rc: &Path) -> PathBuf {
+    let dir = resource_rc
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let main = dir.join("empty_winmain.cpp");
+    fs::write(
+        &main,
+        "#include <windows.h>\n\
+         int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) { return 0; }\n",
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", main.display()));
+
+    let resource_res = run_resource_compiler(resource_rc);
+    let compiler = test_tools_dir().join("MSDEV").join("BIN").join("CL.EXE");
+    let include = test_tools_dir().join("MSDEV").join("INCLUDE");
+    let lib = test_tools_dir().join("MSDEV").join("LIB");
+    assert!(
+        compiler.exists(),
+        "missing compiler `{}`; see tests/tools/TOOLS.md",
+        compiler.display()
+    );
+
+    let output_name = "empty_winmain.exe";
+    let output = Command::new("wine")
+        .arg(&compiler)
+        .arg("/nologo")
+        .arg(format!("/Fe{output_name}"))
+        .arg(main.file_name().expect("WinMain source has a name"))
+        .arg(
+            resource_res
+                .file_name()
+                .expect("resource output has a name"),
+        )
+        .arg("/link")
+        .arg("/subsystem:windows")
+        .current_dir(dir)
+        .env("include", &include)
+        .env("INCLUDE", &include)
+        .env("lib", &lib)
+        .env("LIB", &lib)
+        .output()
+        .expect("failed to run Wine/MSVC compiler");
+    assert_success("compile empty WinMain resource app with MSVC", &output);
+
+    let exe = dir.join(output_name);
+    assert!(exe.exists(), "compiler did not produce `{}`", exe.display());
+    exe
+}
+
 fn compile_fixture(source_name: &str) -> FixtureBuild {
     let project_root = project_root();
     let source_path = project_root
@@ -443,6 +512,444 @@ fn assert_nonempty_file(path: &Path) {
         "`{}` should be non-empty",
         path.display()
     );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TestResourceKey {
+    Id(u16),
+    Name(String),
+}
+
+#[derive(Debug, Clone)]
+struct TestResourceLeaf {
+    typ: TestResourceKey,
+    name: TestResourceKey,
+    language: u16,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ResourceFingerprint {
+    Leaf {
+        typ: TestResourceKey,
+        name: TestResourceKey,
+        language: u16,
+        data: Vec<u8>,
+    },
+    IconOrCursorGroup {
+        typ: u16,
+        name: TestResourceKey,
+        language: u16,
+        group_without_image_ids: Vec<u8>,
+        image_payloads: Vec<Vec<u8>>,
+    },
+    UngroupedIconOrCursor {
+        typ: u16,
+        language: u16,
+        data: Vec<u8>,
+    },
+}
+
+fn assert_resource_fingerprints_match(original: &Path, rebuilt: &Path) {
+    let original_fingerprint = resource_fingerprint(original);
+    let rebuilt_fingerprint = resource_fingerprint(rebuilt);
+    if original_fingerprint != rebuilt_fingerprint {
+        panic!(
+            "{}",
+            resource_fingerprint_mismatch(
+                original,
+                rebuilt,
+                &original_fingerprint,
+                &rebuilt_fingerprint
+            )
+        );
+    }
+}
+
+fn resource_fingerprint_mismatch(
+    original: &Path,
+    rebuilt: &Path,
+    original_fingerprint: &[ResourceFingerprint],
+    rebuilt_fingerprint: &[ResourceFingerprint],
+) -> String {
+    let first_difference = original_fingerprint
+        .iter()
+        .zip(rebuilt_fingerprint)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| original_fingerprint.len().min(rebuilt_fingerprint.len()));
+    format!(
+        "resource fingerprint mismatch after round-trip\n\
+         original: {} ({} entries)\n\
+         rebuilt: {} ({} entries)\n\
+         first difference: {}\n\
+         original entry: {}\n\
+         rebuilt entry: {}",
+        original.display(),
+        original_fingerprint.len(),
+        rebuilt.display(),
+        rebuilt_fingerprint.len(),
+        first_difference,
+        original_fingerprint
+            .get(first_difference)
+            .map(resource_fingerprint_summary)
+            .unwrap_or_else(|| "<missing>".to_owned()),
+        rebuilt_fingerprint
+            .get(first_difference)
+            .map(resource_fingerprint_summary)
+            .unwrap_or_else(|| "<missing>".to_owned())
+    )
+}
+
+fn resource_fingerprint_summary(fingerprint: &ResourceFingerprint) -> String {
+    match fingerprint {
+        ResourceFingerprint::Leaf {
+            typ,
+            name,
+            language,
+            data,
+        } => format!(
+            "leaf type={} name={} language={language:04X} len={} hash={:08X}",
+            resource_key_summary(typ),
+            resource_key_summary(name),
+            data.len(),
+            hash_bytes(data)
+        ),
+        ResourceFingerprint::IconOrCursorGroup {
+            typ,
+            name,
+            language,
+            group_without_image_ids,
+            image_payloads,
+        } => {
+            let payloads = image_payloads
+                .iter()
+                .map(|payload| format!("{}:{:08X}", payload.len(), hash_bytes(payload)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "icon/cursor group type={typ} name={} language={language:04X} group_len={} group_hash={:08X} payloads=[{}]",
+                resource_key_summary(name),
+                group_without_image_ids.len(),
+                hash_bytes(group_without_image_ids),
+                payloads
+            )
+        }
+        ResourceFingerprint::UngroupedIconOrCursor {
+            typ,
+            language,
+            data,
+        } => format!(
+            "ungrouped icon/cursor type={typ} language={language:04X} len={} hash={:08X}",
+            data.len(),
+            hash_bytes(data)
+        ),
+    }
+}
+
+fn resource_key_summary(key: &TestResourceKey) -> String {
+    match key {
+        TestResourceKey::Id(id) => format!("#{id}"),
+        TestResourceKey::Name(name) => name.clone(),
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811C_9DC5, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+fn resource_fingerprint(exe: &Path) -> Vec<ResourceFingerprint> {
+    let leaves = read_resource_leaves(exe);
+    let mut fingerprints = Vec::new();
+    let mut grouped_images = BTreeSet::new();
+
+    for leaf in &leaves {
+        let TestResourceKey::Id(group_type) = leaf.typ else {
+            continue;
+        };
+        let Some(image_type) = grouped_image_type(group_type) else {
+            continue;
+        };
+
+        let image_ids = group_resource_image_ids(leaf);
+        let image_payloads = image_ids
+            .iter()
+            .map(|image_id| {
+                grouped_images.insert((image_type, leaf.language, *image_id));
+                resource_leaf_data(&leaves, image_type, leaf.language, *image_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} group {:?} language {:04X} references missing image resource {}",
+                            exe.display(),
+                            leaf.name,
+                            leaf.language,
+                            image_id
+                        )
+                    })
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+
+        fingerprints.push(ResourceFingerprint::IconOrCursorGroup {
+            typ: group_type,
+            name: leaf.name.clone(),
+            language: leaf.language,
+            group_without_image_ids: group_resource_without_image_ids(leaf),
+            image_payloads,
+        });
+    }
+
+    for leaf in leaves {
+        match leaf.typ {
+            TestResourceKey::Id(resource_type)
+                if resource_type == pe::RT_ICON || resource_type == pe::RT_CURSOR =>
+            {
+                let Some(resource_id) = numeric_resource_key(&leaf.name) else {
+                    fingerprints.push(ResourceFingerprint::Leaf {
+                        typ: TestResourceKey::Id(resource_type),
+                        name: leaf.name,
+                        language: leaf.language,
+                        data: leaf.data,
+                    });
+                    continue;
+                };
+                if !grouped_images.contains(&(resource_type, leaf.language, resource_id)) {
+                    fingerprints.push(ResourceFingerprint::UngroupedIconOrCursor {
+                        typ: resource_type,
+                        language: leaf.language,
+                        data: leaf.data,
+                    });
+                }
+            }
+            TestResourceKey::Id(resource_type)
+                if resource_type == pe::RT_GROUP_ICON || resource_type == pe::RT_GROUP_CURSOR => {}
+            typ => fingerprints.push(ResourceFingerprint::Leaf {
+                typ,
+                name: leaf.name,
+                language: leaf.language,
+                data: leaf.data,
+            }),
+        }
+    }
+
+    fingerprints.sort();
+    fingerprints
+}
+
+fn grouped_image_type(resource_type: u16) -> Option<u16> {
+    match resource_type {
+        pe::RT_GROUP_ICON => Some(pe::RT_ICON),
+        pe::RT_GROUP_CURSOR => Some(pe::RT_CURSOR),
+        _ => None,
+    }
+}
+
+fn group_resource_image_ids(group: &TestResourceLeaf) -> Vec<u16> {
+    let count = read_resource_u16_at(&group.data, 4) as usize;
+    (0..count)
+        .map(|index| read_resource_u16_at(&group.data, 6 + index * 14 + 12))
+        .collect()
+}
+
+fn group_resource_without_image_ids(group: &TestResourceLeaf) -> Vec<u8> {
+    let mut data = group.data.clone();
+    let count = read_resource_u16_at(&data, 4) as usize;
+    for index in 0..count {
+        let id_offset = 6 + index * 14 + 12;
+        data[id_offset] = 0;
+        data[id_offset + 1] = 0;
+    }
+    data
+}
+
+fn read_resource_u16_at(data: &[u8], offset: usize) -> u16 {
+    let bytes = data
+        .get(offset..offset + 2)
+        .unwrap_or_else(|| panic!("resource data ended before offset 0x{offset:X}"));
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn resource_leaf_data(
+    leaves: &[TestResourceLeaf],
+    resource_type: u16,
+    language: u16,
+    resource_id: u16,
+) -> Option<&[u8]> {
+    leaves
+        .iter()
+        .find(|leaf| {
+            leaf.typ == TestResourceKey::Id(resource_type)
+                && leaf.name == TestResourceKey::Id(resource_id)
+                && leaf.language == language
+        })
+        .map(|leaf| leaf.data.as_slice())
+}
+
+fn numeric_resource_key(key: &TestResourceKey) -> Option<u16> {
+    match key {
+        TestResourceKey::Id(id) => Some(*id),
+        TestResourceKey::Name(_) => None,
+    }
+}
+
+fn read_resource_leaves(exe: &Path) -> Vec<TestResourceLeaf> {
+    let image =
+        fs::read(exe).unwrap_or_else(|err| panic!("failed to read `{}`: {err}", exe.display()));
+    match FileKind::parse(&*image)
+        .unwrap_or_else(|err| panic!("failed to identify `{}`: {err}", exe.display()))
+    {
+        FileKind::Pe32 => {
+            let file = PeFile32::parse(&*image)
+                .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", exe.display()));
+            read_pe_resource_leaves(&file, exe)
+        }
+        FileKind::Pe64 => {
+            let file = PeFile64::parse(&*image)
+                .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", exe.display()));
+            read_pe_resource_leaves(&file, exe)
+        }
+        kind => panic!("unsupported test image `{}` kind {kind:?}", exe.display()),
+    }
+}
+
+fn read_pe_resource_leaves<Pe>(file: &PeFile<'_, Pe>, exe: &Path) -> Vec<TestResourceLeaf>
+where
+    Pe: ImageNtHeaders,
+{
+    let Some(directory) = file
+        .data_directories()
+        .resource_directory(file.data(), &file.section_table())
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read PE resources from `{}`: {err}",
+                exe.display()
+            )
+        })
+    else {
+        return Vec::new();
+    };
+    let root = directory.root().unwrap_or_else(|err| {
+        panic!(
+            "failed to parse PE resource root in `{}`: {err}",
+            exe.display()
+        )
+    });
+    collect_test_resource_leaves(file, directory, &root, exe)
+}
+
+fn collect_test_resource_leaves<Pe>(
+    file: &PeFile<'_, Pe>,
+    directory: ResourceDirectory<'_>,
+    root: &ResourceDirectoryTable<'_>,
+    exe: &Path,
+) -> Vec<TestResourceLeaf>
+where
+    Pe: ImageNtHeaders,
+{
+    let mut leaves = Vec::new();
+    for type_entry in root.entries {
+        let typ = test_resource_key(type_entry.name_or_id(), directory, exe);
+        let name_table = test_resource_entry_table(type_entry, directory, "type", exe);
+        for name_entry in name_table.entries {
+            let name = test_resource_key(name_entry.name_or_id(), directory, exe);
+            let language_table = test_resource_entry_table(name_entry, directory, "name", exe);
+            for language_entry in language_table.entries {
+                let language =
+                    test_resource_language_id(language_entry.name_or_id(), directory, exe);
+                let data_entry = match language_entry.data(directory).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to read resource data entry in `{}`: {err}",
+                        exe.display()
+                    )
+                }) {
+                    ResourceDirectoryEntryData::Data(data) => data,
+                    ResourceDirectoryEntryData::Table(_) => {
+                        panic!(
+                            "resource language entry in `{}` points to another table",
+                            exe.display()
+                        )
+                    }
+                };
+                let rva = data_entry.offset_to_data.get(LE);
+                let size = data_entry.size.get(LE) as usize;
+                let data = file
+                    .section_table()
+                    .pe_data_at(file.data(), rva)
+                    .and_then(|bytes| bytes.get(..size))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "resource data in `{}` at RVA 0x{rva:08X} size 0x{size:X} is outside section data",
+                            exe.display()
+                        )
+                    })
+                    .to_vec();
+                leaves.push(TestResourceLeaf {
+                    typ: typ.clone(),
+                    name: name.clone(),
+                    language,
+                    data,
+                });
+            }
+        }
+    }
+    leaves
+}
+
+fn test_resource_key(
+    name_or_id: ResourceNameOrId,
+    directory: ResourceDirectory<'_>,
+    exe: &Path,
+) -> TestResourceKey {
+    match name_or_id {
+        ResourceNameOrId::Id(id) => TestResourceKey::Id(id),
+        ResourceNameOrId::Name(name) => {
+            TestResourceKey::Name(name.to_string_lossy(directory).unwrap_or_else(|err| {
+                panic!(
+                    "failed to decode resource name in `{}`: {err}",
+                    exe.display()
+                )
+            }))
+        }
+    }
+}
+
+fn test_resource_language_id(
+    name_or_id: ResourceNameOrId,
+    directory: ResourceDirectory<'_>,
+    exe: &Path,
+) -> u16 {
+    match test_resource_key(name_or_id, directory, exe) {
+        TestResourceKey::Id(id) => id,
+        TestResourceKey::Name(name) => {
+            panic!(
+                "unsupported named resource language `{name}` in `{}`",
+                exe.display()
+            )
+        }
+    }
+}
+
+fn test_resource_entry_table<'data>(
+    entry: &pe::ImageResourceDirectoryEntry,
+    directory: ResourceDirectory<'data>,
+    context: &str,
+    exe: &Path,
+) -> ResourceDirectoryTable<'data> {
+    match entry.data(directory).unwrap_or_else(|err| {
+        panic!(
+            "failed to read resource {context} table in `{}`: {err}",
+            exe.display()
+        )
+    }) {
+        ResourceDirectoryEntryData::Table(table) => table,
+        ResourceDirectoryEntryData::Data(_) => {
+            panic!(
+                "resource {context} entry in `{}` points directly to data",
+                exe.display()
+            )
+        }
+    }
 }
 
 fn assert_objdiff_matches(build: &FixtureBuild, source_symbols: &[&str]) {
@@ -767,7 +1274,7 @@ fn ti_function_comparison() -> &'static TiFunctionComparison {
 }
 
 fn load_ti_image() -> TiImage {
-    let exe = project_root().join("tests").join("bin").join("TI.EXE");
+    let exe = ti_exe_path();
     assert!(
         exe.exists(),
         "missing test binary `{}`; see tests/tools/TOOLS.md",
@@ -1023,6 +1530,10 @@ fn project_root() -> PathBuf {
 
 fn test_tools_dir() -> PathBuf {
     project_root().join("tests").join("tools")
+}
+
+fn ti_exe_path() -> PathBuf {
+    project_root().join("tests").join("bin").join("TI.EXE")
 }
 
 fn assert_success(context: &str, output: &Output) {
