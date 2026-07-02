@@ -20,10 +20,10 @@ To extract PE resources into an MSVC resource script:
 unres input.exe
 ```
 
-`unres` writes the `.rc` file plus sidecar assets for binary resources such as
-icons, cursors, and raw resource data. By default, sidecar files are written next
-to the script in a `resources` directory, and the script is written as
-`resources.rc`.
+`unres` writes the `.rc` file, a sibling `resources.h` with generated resource
+ID definitions, and sidecar assets for binary resources such as icons, cursors,
+and raw resource data. By default, sidecar files are written next to the script
+in a `resources` directory, and the script is written as `resources.rc`.
 
 ## Testing
 

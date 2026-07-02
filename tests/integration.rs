@@ -80,25 +80,53 @@ fn missing_args_prints_usage_hints() {
 fn unres_extracts_resources_to_msvc_resource_script() {
     let build = compile_resource_fixture();
     let generated_rc = build.dir.join("resources.rc");
+    let generated_header = build.dir.join("resources.h");
     run_unres_default(&build.exe, &build.dir);
 
     let generated_text = fs::read_to_string(&generated_rc)
         .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", generated_rc.display()));
+    let generated_header_text = fs::read_to_string(&generated_header)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", generated_header.display()));
+    assert_contains(&generated_text, "#include \"resources.h\"");
     assert_contains(&generated_text, "LANGUAGE 9, 1");
     assert_contains(&generated_text, "STRINGTABLE");
-    assert_contains(&generated_text, "1 \"Hello from resources\"");
-    assert_contains(&generated_text, "17 \"Second block\"");
+    assert_contains(&generated_text, "IDS_0001 \"Hello from resources\"");
+    assert_contains(&generated_text, "IDS_0011 \"Second block\"");
     assert_contains(
         &generated_text,
-        "1 ICON \"resources/icon_id_0001_lang_0409.ico\"",
+        "IDI_0001 ICON \"resources/icon_id_0001_lang_0409.ico\"",
     );
     assert_contains(
         &generated_text,
-        "2 CURSOR \"resources/cursor_id_0002_lang_0409.cur\"",
+        "IDC_0002 CURSOR \"resources/cursor_id_0002_lang_0409.cur\"",
     );
     assert_contains(
         &generated_text,
-        "102 200 \"resources/resource_type_id_00C8_name_id_0066_lang_0409.bin\"",
+        "IDR_RESOURCE_0066 RT_UNRES_00C8 \"resources/resource_type_id_00C8_name_id_0066_lang_0409.bin\"",
+    );
+    assert_contains(
+        &generated_header_text,
+        "#define IDS_0001                         1",
+    );
+    assert_contains(
+        &generated_header_text,
+        "#define IDS_0011                         17",
+    );
+    assert_contains(
+        &generated_header_text,
+        "#define IDI_0001                         1",
+    );
+    assert_contains(
+        &generated_header_text,
+        "#define IDC_0002                         2",
+    );
+    assert_contains(
+        &generated_header_text,
+        "#define IDR_RESOURCE_0066                102",
+    );
+    assert_contains(
+        &generated_header_text,
+        "#define RT_UNRES_00C8                    200",
     );
 
     assert_nonempty_file(&build.dir.join("resources/icon_id_0001_lang_0409.ico"));

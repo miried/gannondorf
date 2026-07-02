@@ -9,9 +9,9 @@ use unlink::{Result, UnlinkError, extract_resource_script};
     author,
     version,
     about = "Extract Win32 PE resources into an MSVC resource script.",
-    long_about = "Extract resources from a PE executable and write an MSVC-compatible .rc script plus sidecar files for binary resources such as icons, cursors, and raw data.",
+    long_about = "Extract resources from a PE executable and write an MSVC-compatible .rc script, resources.h header, and sidecar files for binary resources such as icons, cursors, and raw data.",
     arg_required_else_help = true,
-    after_help = "Examples:\n  unres input.exe\n  unres input.exe -o generated.rc --asset-dir resources_assets\n\nOutput:\n  The .rc file references sidecar assets using paths relative to the .rc file directory when --asset-dir is relative."
+    after_help = "Examples:\n  unres input.exe\n  unres input.exe -o generated.rc --asset-dir resources_assets\n\nOutput:\n  The .rc file includes resources.h from the same directory and references sidecar assets using paths relative to the .rc file directory when --asset-dir is relative."
 )]
 struct Args {
     /// PE executable to extract resources from.
@@ -55,6 +55,7 @@ fn run() -> Result<()> {
     let (asset_write_base, asset_rc_prefix) =
         resolve_asset_directory(args.asset_dir.as_deref(), &output);
     let extracted = extract_resource_script(&input, &asset_rc_prefix)?;
+    let header_output = header_output_path(&output);
 
     for asset in &extracted.assets {
         let path = asset_write_base.join(&asset.relative_path);
@@ -74,16 +75,31 @@ fn run() -> Result<()> {
     fs::write(&output, extracted.rc_text).map_err(|err| {
         UnlinkError::new(format!("failed to write `{}`: {err}", output.display()))
     })?;
+    fs::write(&header_output, extracted.header_text).map_err(|err| {
+        UnlinkError::new(format!(
+            "failed to write `{}`: {err}",
+            header_output.display()
+        ))
+    })?;
     println!(
-        "wrote {} resource asset(s) and {}",
+        "wrote {} resource asset(s), {}, and {}",
         extracted.assets.len(),
-        output.display()
+        output.display(),
+        header_output.display()
     );
     Ok(())
 }
 
 fn default_output_path() -> PathBuf {
     PathBuf::from("resources.rc")
+}
+
+fn header_output_path(output: &Path) -> PathBuf {
+    output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("resources.h")
 }
 
 fn resolve_asset_directory(asset_dir: Option<&Path>, output: &Path) -> (PathBuf, String) {

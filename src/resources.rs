@@ -14,6 +14,7 @@ use crate::{Result, UnlinkError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedResources {
     pub rc_text: String,
+    pub header_text: String,
     pub assets: Vec<ResourceAsset>,
 }
 
@@ -58,6 +59,19 @@ struct ResourceRenderer {
     asset_prefix: String,
     used_asset_names: BTreeSet<String>,
     current_language: Option<u16>,
+    definitions: ResourceDefinitions,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceDefinitions {
+    definitions: Vec<ResourceDefinition>,
+    values_by_name: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceDefinition {
+    name: String,
+    value: u32,
 }
 
 pub fn extract_resource_script(image: &[u8], asset_dir_name: &str) -> Result<ExtractedResources> {
@@ -92,10 +106,7 @@ where
         .resource_directory(file.data(), &file.section_table())
         .map_err(|err| UnlinkError::new(format!("failed to read PE resources: {err}")))?
     else {
-        return Ok(ExtractedResources {
-            rc_text: String::new(),
-            assets: Vec::new(),
-        });
+        return Ok(ResourceRenderer::new(asset_dir_name).finish());
     };
 
     let root = directory
@@ -285,18 +296,24 @@ fn render_resource_script(
                 continue;
             }
             ResourceKey::Id(pe::RT_STRING) if handled.contains(&index) => continue,
-            ResourceKey::Id(pe::RT_MENU) => match render_menu_resource(leaf) {
-                Ok(text) => renderer.render_text_resource(leaf.language, &text),
-                Err(_) => renderer.render_raw_resource(leaf)?,
-            },
-            ResourceKey::Id(pe::RT_DIALOG) => match render_dialog_resource(leaf) {
-                Ok(text) => renderer.render_text_resource(leaf.language, &text),
-                Err(_) => renderer.render_raw_resource(leaf)?,
-            },
-            ResourceKey::Id(pe::RT_ACCELERATOR) => match render_accelerator_resource(leaf) {
-                Ok(text) => renderer.render_text_resource(leaf.language, &text),
-                Err(_) => renderer.render_raw_resource(leaf)?,
-            },
+            ResourceKey::Id(pe::RT_MENU) => {
+                match render_menu_resource(leaf, &mut renderer.definitions) {
+                    Ok(text) => renderer.render_text_resource(leaf.language, &text),
+                    Err(_) => renderer.render_raw_resource(leaf)?,
+                }
+            }
+            ResourceKey::Id(pe::RT_DIALOG) => {
+                match render_dialog_resource(leaf, &mut renderer.definitions) {
+                    Ok(text) => renderer.render_text_resource(leaf.language, &text),
+                    Err(_) => renderer.render_raw_resource(leaf)?,
+                }
+            }
+            ResourceKey::Id(pe::RT_ACCELERATOR) => {
+                match render_accelerator_resource(leaf, &mut renderer.definitions) {
+                    Ok(text) => renderer.render_text_resource(leaf.language, &text),
+                    Err(_) => renderer.render_raw_resource(leaf)?,
+                }
+            }
             _ => renderer.render_raw_resource(leaf)?,
         }
     }
@@ -326,6 +343,64 @@ fn numeric_name(name: &ResourceKey) -> Option<u16> {
     }
 }
 
+impl ResourceDefinitions {
+    fn new() -> Self {
+        Self {
+            definitions: Vec::new(),
+            values_by_name: BTreeMap::new(),
+        }
+    }
+
+    fn resource_key_reference(&mut self, key: &ResourceKey, prefix: &str) -> String {
+        match key {
+            ResourceKey::Id(id) => self.define_numeric(prefix, u32::from(*id)),
+            ResourceKey::Name(_) => rc_resource_key(key),
+        }
+    }
+
+    fn resource_type_reference(&mut self, key: &ResourceKey) -> String {
+        match key {
+            ResourceKey::Id(id) => self.define_numeric("RT_UNRES", u32::from(*id)),
+            ResourceKey::Name(_) => rc_resource_key(key),
+        }
+    }
+
+    fn define_numeric(&mut self, prefix: &str, value: u32) -> String {
+        let name = format!("{prefix}_{}", numeric_define_token(value));
+        self.define(name, value)
+    }
+
+    fn define(&mut self, name: String, value: u32) -> String {
+        if let Some(existing) = self.values_by_name.get(&name) {
+            if *existing == value {
+                return name;
+            }
+        }
+
+        let base_name = name;
+        for suffix in 1.. {
+            let candidate = if suffix == 1 {
+                base_name.clone()
+            } else {
+                format!("{base_name}_{suffix}")
+            };
+            match self.values_by_name.get(&candidate) {
+                Some(existing) if *existing == value => return candidate,
+                Some(_) => continue,
+                None => {
+                    self.values_by_name.insert(candidate.clone(), value);
+                    self.definitions.push(ResourceDefinition {
+                        name: candidate.clone(),
+                        value,
+                    });
+                    return candidate;
+                }
+            }
+        }
+        unreachable!("unbounded suffix search must find a definition name");
+    }
+}
+
 impl ResourceRenderer {
     fn new(asset_dir_name: &str) -> Self {
         Self {
@@ -334,12 +409,17 @@ impl ResourceRenderer {
             asset_prefix: normalize_rc_path(asset_dir_name),
             used_asset_names: BTreeSet::new(),
             current_language: None,
+            definitions: ResourceDefinitions::new(),
         }
     }
 
     fn finish(self) -> ExtractedResources {
+        let mut rc_text = String::from("#include \"resources.h\"\n\n");
+        rc_text.push_str(&self.rc_text);
+        let header_text = resource_header_text(&self.definitions.definitions);
         ExtractedResources {
-            rc_text: self.rc_text,
+            rc_text,
+            header_text,
             assets: self.assets,
         }
     }
@@ -365,8 +445,9 @@ impl ResourceRenderer {
                 continue;
             };
             let string_id = base_id + index as u32;
+            let string_name = self.definitions.define_numeric("IDS", string_id);
             self.rc_text.push_str(&format!(
-                "    {string_id} \"{}\"\n",
+                "    {string_name} \"{}\"\n",
                 escape_rc_utf16_string(string)
             ));
         }
@@ -396,9 +477,12 @@ impl ResourceRenderer {
             leaf.language
         );
         let path = self.add_asset(file_name, bytes);
+        let name = self
+            .definitions
+            .resource_key_reference(&leaf.name, icon_or_cursor_prefix(kind));
         self.rc_text.push_str(&format!(
             "{} {keyword} \"{}\"\n\n",
-            rc_resource_key(&leaf.name),
+            name,
             escape_rc_text(&path)
         ));
         Ok(())
@@ -413,10 +497,14 @@ impl ResourceRenderer {
             leaf.language
         );
         let path = self.add_asset(file_name, leaf.data.to_vec());
+        let name = self
+            .definitions
+            .resource_key_reference(&leaf.name, resource_name_prefix(&leaf.typ));
+        let typ = self.definitions.resource_type_reference(&leaf.typ);
         self.rc_text.push_str(&format!(
             "{} {} \"{}\"\n\n",
-            rc_resource_key(&leaf.name),
-            rc_resource_key(&leaf.typ),
+            name,
+            typ,
             escape_rc_text(&path)
         ));
         Ok(())
@@ -650,6 +738,53 @@ fn ico_dimension(value: u16) -> u8 {
     }
 }
 
+fn icon_or_cursor_prefix(kind: IconFileKind) -> &'static str {
+    match kind {
+        IconFileKind::Icon => "IDI",
+        IconFileKind::Cursor => "IDC",
+    }
+}
+
+fn resource_name_prefix(typ: &ResourceKey) -> &'static str {
+    match typ {
+        ResourceKey::Id(pe::RT_BITMAP) => "IDB",
+        ResourceKey::Id(pe::RT_CURSOR) => "IDC",
+        ResourceKey::Id(pe::RT_ICON) => "IDI",
+        ResourceKey::Id(pe::RT_MENU) => "IDR_MENU",
+        ResourceKey::Id(pe::RT_DIALOG) => "IDD",
+        ResourceKey::Id(pe::RT_STRING) => "IDS_BLOCK",
+        ResourceKey::Id(pe::RT_ACCELERATOR) => "IDR_ACCELERATOR",
+        ResourceKey::Id(pe::RT_GROUP_CURSOR) => "IDC",
+        ResourceKey::Id(pe::RT_GROUP_ICON) => "IDI",
+        ResourceKey::Id(pe::RT_VERSION) => "IDR_VERSION",
+        _ => "IDR_RESOURCE",
+    }
+}
+
+fn resource_header_text(definitions: &[ResourceDefinition]) -> String {
+    let mut output = String::from(
+        "// Generated by unres.\n\
+         #ifndef UNRES_RESOURCES_H\n\
+         #define UNRES_RESOURCES_H\n\n",
+    );
+    for definition in definitions {
+        output.push_str(&format!(
+            "#define {:<32} {}\n",
+            definition.name, definition.value
+        ));
+    }
+    output.push_str("\n#endif\n");
+    output
+}
+
+fn numeric_define_token(value: u32) -> String {
+    if value <= 0xFFFF {
+        format!("{value:04X}")
+    } else {
+        format!("{value:06X}")
+    }
+}
+
 fn rc_resource_key(key: &ResourceKey) -> String {
     match key {
         ResourceKey::Id(id) => id.to_string(),
@@ -803,7 +938,10 @@ const ACCEL_CONTROL: u16 = 0x0008;
 const ACCEL_ALT: u16 = 0x0010;
 const ACCEL_LAST: u16 = 0x0080;
 
-fn render_menu_resource(leaf: &ResourceLeaf<'_>) -> Result<String> {
+fn render_menu_resource(
+    leaf: &ResourceLeaf<'_>,
+    definitions: &mut ResourceDefinitions,
+) -> Result<String> {
     let data = leaf.data;
     if read_u16_at(data, 0)? != 0 {
         return Err(UnlinkError::new("extended menus are not implemented"));
@@ -819,8 +957,9 @@ fn render_menu_resource(leaf: &ResourceLeaf<'_>) -> Result<String> {
     let items = parse_menu_items(data, &mut offset)?;
     reject_nonzero_trailing_data(data, offset, "menu")?;
 
-    let mut output = format!("{} MENU\nBEGIN\n", rc_resource_key(&leaf.name));
-    render_menu_items(&mut output, &items, 1)?;
+    let name = definitions.resource_key_reference(&leaf.name, "IDR_MENU");
+    let mut output = format!("{name} MENU\nBEGIN\n");
+    render_menu_items(&mut output, &items, 1, definitions)?;
     output.push_str("END\n\n");
     Ok(output)
 }
@@ -859,14 +998,24 @@ fn parse_menu_items(data: &[u8], offset: &mut usize) -> Result<Vec<MenuItem>> {
     Ok(items)
 }
 
-fn render_menu_items(output: &mut String, items: &[MenuItem], indent: usize) -> Result<()> {
+fn render_menu_items(
+    output: &mut String,
+    items: &[MenuItem],
+    indent: usize,
+    definitions: &mut ResourceDefinitions,
+) -> Result<()> {
     for item in items {
-        render_menu_item(output, item, indent)?;
+        render_menu_item(output, item, indent, definitions)?;
     }
     Ok(())
 }
 
-fn render_menu_item(output: &mut String, item: &MenuItem, indent: usize) -> Result<()> {
+fn render_menu_item(
+    output: &mut String,
+    item: &MenuItem,
+    indent: usize,
+    definitions: &mut ResourceDefinitions,
+) -> Result<()> {
     let indent_text = "    ".repeat(indent);
     if item.flags & MENU_POPUP != 0 {
         output.push_str(&format!(
@@ -874,7 +1023,7 @@ fn render_menu_item(output: &mut String, item: &MenuItem, indent: usize) -> Resu
             escape_rc_utf16_string(&item.text),
             menu_option_suffix(item.flags & !(MENU_POPUP | MENU_END | MENU_SEPARATOR))?
         ));
-        render_menu_items(output, &item.children, indent + 1)?;
+        render_menu_items(output, &item.children, indent + 1, definitions)?;
         output.push_str(&format!("{indent_text}END\n"));
         return Ok(());
     }
@@ -892,10 +1041,11 @@ fn render_menu_item(output: &mut String, item: &MenuItem, indent: usize) -> Resu
         return Ok(());
     }
 
+    let id_name = definitions.define_numeric("IDM", u32::from(id));
     output.push_str(&format!(
         "{indent_text}MENUITEM \"{}\", {}{}\n",
         escape_rc_utf16_string(&item.text),
-        id,
+        id_name,
         menu_option_suffix(item.flags & !MENU_END)?
     ));
     Ok(())
@@ -932,15 +1082,15 @@ fn menu_option_suffix(flags: u16) -> Result<String> {
     }
 }
 
-fn render_dialog_resource(leaf: &ResourceLeaf<'_>) -> Result<String> {
+fn render_dialog_resource(
+    leaf: &ResourceLeaf<'_>,
+    definitions: &mut ResourceDefinitions,
+) -> Result<String> {
     let dialog = parse_dialog_template(leaf.data)?;
+    let name = definitions.resource_key_reference(&leaf.name, "IDD");
     let mut output = format!(
         "{} DIALOG {}, {}, {}, {}\n",
-        rc_resource_key(&leaf.name),
-        dialog.x,
-        dialog.y,
-        dialog.cx,
-        dialog.cy
+        name, dialog.x, dialog.y, dialog.cx, dialog.cy
     );
     output.push_str(&format!("STYLE 0x{:08X}\n", dialog.style));
     if dialog.extended_style != 0 {
@@ -964,7 +1114,7 @@ fn render_dialog_resource(leaf: &ResourceLeaf<'_>) -> Result<String> {
     }
     output.push_str("BEGIN\n");
     for control in &dialog.controls {
-        render_dialog_control(&mut output, control)?;
+        render_dialog_control(&mut output, control, definitions)?;
     }
     output.push_str("END\n\n");
     Ok(output)
@@ -1056,11 +1206,16 @@ fn parse_dialog_template(data: &[u8]) -> Result<DialogTemplate> {
     })
 }
 
-fn render_dialog_control(output: &mut String, control: &DialogControl) -> Result<()> {
+fn render_dialog_control(
+    output: &mut String,
+    control: &DialogControl,
+    definitions: &mut ResourceDefinitions,
+) -> Result<()> {
+    let id = definitions.define_numeric("IDC", u32::from(control.id));
     output.push_str(&format!(
         "    CONTROL {}, {}, {}, 0x{:08X}, {}, {}, {}, {}",
         dialog_control_title(&control.title)?,
-        control.id,
+        id,
         dialog_control_class(&control.class)?,
         control.style,
         control.x,
@@ -1075,14 +1230,18 @@ fn render_dialog_control(output: &mut String, control: &DialogControl) -> Result
     Ok(())
 }
 
-fn render_accelerator_resource(leaf: &ResourceLeaf<'_>) -> Result<String> {
+fn render_accelerator_resource(
+    leaf: &ResourceLeaf<'_>,
+    definitions: &mut ResourceDefinitions,
+) -> Result<String> {
     if !leaf.data.len().is_multiple_of(8) {
         return Err(UnlinkError::new(
             "accelerator resource size is not a multiple of entry size",
         ));
     }
 
-    let mut output = format!("{} ACCELERATORS\nBEGIN\n", rc_resource_key(&leaf.name));
+    let name = definitions.resource_key_reference(&leaf.name, "IDR_ACCELERATOR");
+    let mut output = format!("{name} ACCELERATORS\nBEGIN\n");
     let entry_count = leaf.data.len() / 8;
     for index in 0..entry_count {
         let offset = index * 8;
@@ -1098,10 +1257,11 @@ fn render_accelerator_resource(leaf: &ResourceLeaf<'_>) -> Result<String> {
                 "accelerator last-entry marker is not on the final entry",
             ));
         }
+        let id_name = definitions.define_numeric("ID_ACCEL", u32::from(id));
         output.push_str(&format!(
             "    {}, {}, {}\n",
             key,
-            id,
+            id_name,
             accelerator_options(flags & !ACCEL_LAST)?
         ));
     }
