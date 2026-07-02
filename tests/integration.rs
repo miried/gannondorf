@@ -70,6 +70,49 @@ fn missing_args_prints_usage_hints() {
 }
 
 #[test]
+fn unres_extracts_resources_to_msvc_resource_script() {
+    let build = compile_resource_fixture();
+    let generated_rc = build.dir.join("generated.rc");
+    run_unres(&build.exe, &generated_rc);
+
+    let generated_text = fs::read_to_string(&generated_rc)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", generated_rc.display()));
+    assert_contains(&generated_text, "LANGUAGE 9, 1");
+    assert_contains(&generated_text, "STRINGTABLE");
+    assert_contains(&generated_text, "1 \"Hello from resources\"");
+    assert_contains(&generated_text, "17 \"Second block\"");
+    assert_contains(
+        &generated_text,
+        "1 ICON \"generated_resources/icon_id_0001_lang_0409.ico\"",
+    );
+    assert_contains(
+        &generated_text,
+        "2 CURSOR \"generated_resources/cursor_id_0002_lang_0409.cur\"",
+    );
+    assert_contains(
+        &generated_text,
+        "102 200 \"generated_resources/resource_type_id_00C8_name_id_0066_lang_0409.bin\"",
+    );
+
+    assert_nonempty_file(
+        &build
+            .dir
+            .join("generated_resources/icon_id_0001_lang_0409.ico"),
+    );
+    assert_nonempty_file(
+        &build
+            .dir
+            .join("generated_resources/cursor_id_0002_lang_0409.cur"),
+    );
+    assert_nonempty_file(
+        &build
+            .dir
+            .join("generated_resources/resource_type_id_00C8_name_id_0066_lang_0409.bin"),
+    );
+    run_resource_compiler(&generated_rc);
+}
+
+#[test]
 fn compiled_basic_fixture_matches_extracted_objects() {
     let build = build_and_extract_fixture("basic.cpp");
     assert_objdiff_matches(
@@ -180,10 +223,94 @@ struct FixtureBuild {
     extracted_dir: PathBuf,
 }
 
+struct ResourceFixtureBuild {
+    dir: PathBuf,
+    exe: PathBuf,
+}
+
 fn build_and_extract_fixture(source_name: &str) -> FixtureBuild {
     let build = compile_fixture(source_name);
     run_unlink_discovery(&build.exe, &build.extracted_dir);
     build
+}
+
+fn compile_resource_fixture() -> ResourceFixtureBuild {
+    let dir = new_test_dir("resources");
+    let main = dir.join("main.cpp");
+    fs::write(&main, "int main() { return 0; }\n")
+        .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", main.display()));
+
+    let source_icon = test_tools_dir()
+        .join("MSDEV")
+        .join("SAMPLES")
+        .join("APPWIZ")
+        .join("LOGOWIZ")
+        .join("RES")
+        .join("LOGOWIZ.ICO");
+    let source_cursor = test_tools_dir()
+        .join("MSDEV")
+        .join("SAMPLES")
+        .join("SDK")
+        .join("OLE")
+        .join("OUTLINE")
+        .join("BTTNCUR")
+        .join("RES")
+        .join("MAGNIFY.CUR");
+    fs::copy(&source_icon, dir.join("input.ico")).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy `{}` into resource fixture: {err}",
+            source_icon.display()
+        )
+    });
+    fs::copy(&source_cursor, dir.join("input.cur")).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy `{}` into resource fixture: {err}",
+            source_cursor.display()
+        )
+    });
+    fs::write(dir.join("payload.bin"), b"raw resource payload").unwrap();
+
+    let resource_rc = dir.join("input.rc");
+    fs::write(
+        &resource_rc,
+        "LANGUAGE 9, 1\n\
+         STRINGTABLE\n\
+         BEGIN\n\
+             1 \"Hello from resources\"\n\
+             17 \"Second block\"\n\
+         END\n\
+         \n\
+         1 ICON \"input.ico\"\n\
+         2 CURSOR \"input.cur\"\n\
+         102 200 \"payload.bin\"\n",
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", resource_rc.display()));
+
+    let resource_res = run_resource_compiler(&resource_rc);
+    let compiler = test_tools_dir().join("MSDEV").join("BIN").join("CL.EXE");
+    let include = test_tools_dir().join("MSDEV").join("INCLUDE");
+    let lib = test_tools_dir().join("MSDEV").join("LIB");
+    let output = Command::new("wine")
+        .arg(&compiler)
+        .arg("/nologo")
+        .arg(main.file_name().expect("main source has a name"))
+        .arg(
+            resource_res
+                .file_name()
+                .expect("resource output has a name"),
+        )
+        .current_dir(&dir)
+        .env("include", &include)
+        .env("INCLUDE", &include)
+        .env("lib", &lib)
+        .env("LIB", &lib)
+        .output()
+        .expect("failed to run Wine/MSVC compiler");
+    assert_success("compile resource fixture with MSVC", &output);
+
+    let exe = dir.join("main.exe");
+    assert!(exe.exists(), "compiler did not produce `{}`", exe.display());
+    ResourceFixtureBuild { dir, exe }
 }
 
 fn compile_fixture(source_name: &str) -> FixtureBuild {
@@ -262,6 +389,60 @@ fn run_unlink_address(exe: &Path, address: u64, output_obj: &Path) {
         .output()
         .expect("failed to run unlink address extraction");
     assert_success("run unlink address extraction", &output);
+}
+
+fn run_unres(exe: &Path, output_rc: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_unres"))
+        .arg(exe)
+        .arg("-o")
+        .arg(output_rc)
+        .output()
+        .expect("failed to run unres");
+    assert_success("run unres resource extraction", &output);
+}
+
+fn run_resource_compiler(rc: &Path) -> PathBuf {
+    let compiler = test_tools_dir().join("MSDEV").join("BIN").join("RC.EXE");
+    assert!(
+        compiler.exists(),
+        "missing resource compiler `{}`; see tests/tools/TOOLS.md",
+        compiler.display()
+    );
+    let dir = rc
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output = Command::new("wine")
+        .arg(&compiler)
+        .arg(rc.file_name().expect("resource script has a name"))
+        .current_dir(dir)
+        .output()
+        .expect("failed to run Wine/MSVC resource compiler");
+    assert_success("compile resource script with RC.EXE", &output);
+
+    let lowercase = rc.with_extension("res");
+    let uppercase = rc.with_extension("RES");
+    if lowercase.exists() {
+        lowercase
+    } else {
+        assert!(
+            uppercase.exists(),
+            "resource compiler produced neither `{}` nor `{}`",
+            lowercase.display(),
+            uppercase.display()
+        );
+        uppercase
+    }
+}
+
+fn assert_nonempty_file(path: &Path) {
+    let metadata = fs::metadata(path)
+        .unwrap_or_else(|err| panic!("failed to stat `{}`: {err}", path.display()));
+    assert!(
+        metadata.len() > 0,
+        "`{}` should be non-empty",
+        path.display()
+    );
 }
 
 fn assert_objdiff_matches(build: &FixtureBuild, source_symbols: &[&str]) {
@@ -713,10 +894,10 @@ fn parse_ghidra_function(
             }
         })
         .collect::<Vec<_>>();
-    for index in 0..instructions.len() {
-        let va = instructions[index].va;
+    for instruction in &mut instructions {
+        let va = instruction.va;
         let len = image.decode_instruction_len_at(va);
-        instructions[index].bytes = image.bytes_at(va, len);
+        instruction.bytes = image.bytes_at(va, len);
     }
     instructions
 }
@@ -780,7 +961,7 @@ fn parse_hex_address(input: &str) -> u64 {
 
 fn parse_hex_bytes(input: &str) -> Vec<u8> {
     assert!(
-        input.len() % 2 == 0,
+        input.len().is_multiple_of(2),
         "hex byte string has odd length: `{input}`"
     );
     (0..input.len())

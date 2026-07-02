@@ -14,6 +14,16 @@ When `--address` is omitted, `unlink` discovers PE32/i386 functions automaticall
 unlink input.exe -o extracted-objects
 ```
 
+To extract PE resources into an MSVC resource script:
+
+```sh
+unres input.exe -o resources.rc
+```
+
+`unres` writes the `.rc` file plus sidecar assets for binary resources such as
+icons, cursors, and raw resource data. By default, sidecar files are written next
+to the script in a `<script-stem>_resources` directory.
+
 ## Testing
 
 `cargo test` runs helper-level unit tests plus integration tests that compile the

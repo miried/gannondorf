@@ -16,6 +16,10 @@ use object::{
     SectionKind, SymbolFlags, SymbolKind, SymbolScope,
 };
 
+mod resources;
+
+pub use resources::{ExtractedResources, ResourceAsset, extract_resource_script};
+
 pub type Result<T> = std::result::Result<T, UnlinkError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,21 +568,21 @@ fn decode_function(
                     break;
                 }
                 FlowControl::UnconditionalBranch => {
-                    if let Some(branch) = branch {
-                        if !branch_crosses_known_function_start(
+                    if let Some(branch) = branch
+                        && !branch_crosses_known_function_start(
                             function_va,
                             next_ip,
                             branch.target,
                             function_starts,
-                        ) {
-                            queue_cfg_successor(
-                                section,
-                                function_va,
-                                &mut pending,
-                                branch.target,
-                                allow_lower_blocks,
-                            );
-                        }
+                        )
+                    {
+                        queue_cfg_successor(
+                            section,
+                            function_va,
+                            &mut pending,
+                            branch.target,
+                            allow_lower_blocks,
+                        );
                     }
                     break;
                 }
