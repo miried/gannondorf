@@ -18,7 +18,7 @@ use object::read::pe::{
     ResourceDirectoryTable, ResourceNameOrId,
 };
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();
@@ -121,6 +121,63 @@ fn cxxunlink_extracts_addresses_from_annotated_source() {
     for (address, symbol) in addresses.iter().zip(source_symbols) {
         assert_objdiff_symbol_matches(&output, &build.obj, &format_code_symbol(*address), symbol);
     }
+
+    let target_dir = build.dir.join("target");
+    fs::create_dir_all(&target_dir)
+        .unwrap_or_else(|err| panic!("failed to create `{}`: {err}", target_dir.display()));
+    let objdiff_json = build.dir.join("objdiff.json");
+    fs::write(
+        &objdiff_json,
+        serde_json::to_string_pretty(&json!({
+            "build_base": true,
+            "units": [
+                {
+                    "name": "basic",
+                    "metadata": {
+                        "complete": true
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", objdiff_json.display()));
+
+    run_cxxunlink_objdiff(
+        &build.dir,
+        Path::new("mapping.cpp"),
+        Path::new("."),
+        Path::new("target/mapped.obj"),
+        Path::new("objdiff.json"),
+        "basic",
+        Path::new("target/mapped.obj"),
+        Path::new("basic.obj"),
+        Path::new("src/mapping.cpp"),
+    );
+
+    let generated_json = fs::read_to_string(&objdiff_json)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", objdiff_json.display()));
+    let config: Value = serde_json::from_str(&generated_json)
+        .unwrap_or_else(|err| panic!("failed to parse generated objdiff JSON: {err}"));
+    assert_eq!(config["build_base"], true);
+    let unit = &config["units"][0];
+    assert_eq!(unit["name"], "basic");
+    assert_eq!(unit["target_path"], "target/mapped.obj");
+    assert_eq!(unit["base_path"], "basic.obj");
+    assert_eq!(unit["metadata"]["complete"], true);
+    assert_eq!(unit["metadata"]["source_path"], "src/mapping.cpp");
+    assert_eq!(
+        unit["symbol_mappings"][format_code_symbol(addresses[0]).as_str()],
+        source_symbols[0]
+    );
+    assert_eq!(
+        unit["symbol_mappings"][format_code_symbol(addresses[1]).as_str()],
+        source_symbols[1]
+    );
+    assert_eq!(
+        unit["symbol_mappings"][format_code_symbol(addresses[2]).as_str()],
+        source_symbols[2]
+    );
 }
 
 #[test]
@@ -571,6 +628,38 @@ fn run_cxxunlink(source: &Path, binary_dir: &Path, output_obj: &Path) {
         .output()
         .expect("failed to run cxxunlink");
     assert_success("run cxxunlink extraction", &output);
+}
+
+fn run_cxxunlink_objdiff(
+    current_dir: &Path,
+    source: &Path,
+    binary_dir: &Path,
+    output_obj: &Path,
+    objdiff_json: &Path,
+    unit_name: &str,
+    target_path: &Path,
+    base_path: &Path,
+    source_path: &Path,
+) {
+    let output = Command::new(env!("CARGO_BIN_EXE_cxxunlink"))
+        .current_dir(current_dir)
+        .arg(source)
+        .arg(binary_dir)
+        .arg("-o")
+        .arg(output_obj)
+        .arg("--objdiff-json")
+        .arg(objdiff_json)
+        .arg("--objdiff-unit-name")
+        .arg(unit_name)
+        .arg("--objdiff-target-path")
+        .arg(target_path)
+        .arg("--objdiff-base-path")
+        .arg(base_path)
+        .arg("--objdiff-source-path")
+        .arg(source_path)
+        .output()
+        .expect("failed to run cxxunlink with objdiff JSON output");
+    assert_success("run cxxunlink objdiff extraction", &output);
 }
 
 fn run_unres(exe: &Path, output_rc: &Path) {

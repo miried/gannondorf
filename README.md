@@ -55,6 +55,20 @@ combined object for every mapped function address:
 cxxunlink tests/mapping_test.cpp tests/bin -o mapped.obj
 ```
 
+It can also create or update an objdiff `units` entry for the extracted object:
+
+```sh
+cxxunlink src/sub_004321D0.cpp bin \
+  -o target/sub_004321D0.obj \
+  --objdiff-json objdiff.json \
+  --objdiff-unit-name WinMain \
+  --objdiff-base-path build/sub_004321D0.obj
+```
+
+The generated unit includes `target_path`, `base_path` when supplied,
+`metadata.source_path`, and `symbol_mappings` from extracted `sub_XXXXXXXX`
+symbols to the corresponding source-object symbols.
+
 ## `unres`
 
 To extract PE resources into an MSVC resource script:
