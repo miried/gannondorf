@@ -5,9 +5,9 @@ mod mapping;
 mod resources;
 
 pub use functions::{
-    DisassembledInstruction, DiscoveredFunction, ExtractedObject, default_output_path,
-    discover_function_addresses, discover_functions, extract_function_object,
-    extract_function_objects, parse_address,
+    DisassembledInstruction, DiscoveredFunction, ExtractedFunction, ExtractedMultiObject,
+    ExtractedObject, default_output_path, discover_function_addresses, discover_functions,
+    extract_function_object, extract_function_objects, extract_functions_object, parse_address,
 };
 pub use mapping::{
     FunctionMapping, MappingEntry, extract_function_mapping, parse_function_mapping_ast,

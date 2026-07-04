@@ -16,6 +16,12 @@ To extract one known function:
 unlink input.exe --address 0x401000 -o sub_00401000.obj
 ```
 
+To extract several known functions into one object:
+
+```sh
+unlink input.exe --address 0x401000 --address 0x401050 -o selected.obj
+```
+
 When `--address` is omitted, `unlink` discovers PE32/i386 functions automatically and writes one `sub_XXXXXXXX.obj` file per discovered function. In this mode, `-o/--output` is an output directory:
 
 ```sh

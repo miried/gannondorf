@@ -26,6 +26,19 @@ pub struct ExtractedObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedFunction {
+    pub symbol_name: String,
+    pub function_va: u64,
+    pub function_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedMultiObject {
+    pub functions: Vec<ExtractedFunction>,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredFunction {
     pub symbol_name: String,
     pub function_va: u64,
@@ -71,6 +84,13 @@ struct DecodedInstruction {
     branch: Option<BranchReference>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FunctionLayout {
+    va: u64,
+    len: u64,
+    output_offset: u64,
+}
+
 #[derive(Debug, Clone)]
 struct BranchReference {
     kind: DirectBranchKind,
@@ -108,6 +128,30 @@ pub fn extract_function_object(image: &[u8], requested_address: u64) -> Result<E
     let function_va = normalize_address(requested_address, image.image_base);
     let function = image.decode_function(function_va)?;
     write_extracted_object(&function, &image)
+}
+
+pub fn extract_functions_object(
+    image: &[u8],
+    requested_addresses: &[u64],
+) -> Result<ExtractedMultiObject> {
+    if requested_addresses.is_empty() {
+        return Err(Error::new("at least one function address is required"));
+    }
+
+    let image = PeI386Image::parse(image)?;
+    let mut seen = BTreeSet::new();
+    let mut functions = Vec::with_capacity(requested_addresses.len());
+    for &requested_address in requested_addresses {
+        let function_va = normalize_address(requested_address, image.image_base);
+        if !seen.insert(function_va) {
+            return Err(Error::new(format!(
+                "function address 0x{function_va:08X} was specified more than once"
+            )));
+        }
+        functions.push(image.decode_function(function_va)?);
+    }
+
+    write_extracted_multi_object(&functions, &image)
 }
 
 pub fn discover_function_addresses(image: &[u8]) -> Result<Vec<u64>> {
@@ -186,20 +230,38 @@ fn write_extracted_object(
     function: &FunctionImage,
     image: &PeI386Image<'_>,
 ) -> Result<ExtractedObject> {
-    let symbol_name = code_symbol_name(function.va);
+    let metadata = describe_extracted_function(function);
     let bytes = write_coff_object(
-        function,
+        std::slice::from_ref(function),
         &image.sections,
         &image.base_relocations,
-        &symbol_name,
     )?;
 
     Ok(ExtractedObject {
-        symbol_name,
-        function_va: function.va,
-        function_len: function.bytes.len() as u64,
+        symbol_name: metadata.symbol_name,
+        function_va: metadata.function_va,
+        function_len: metadata.function_len,
         bytes,
     })
+}
+
+fn write_extracted_multi_object(
+    functions: &[FunctionImage],
+    image: &PeI386Image<'_>,
+) -> Result<ExtractedMultiObject> {
+    let bytes = write_coff_object(functions, &image.sections, &image.base_relocations)?;
+    Ok(ExtractedMultiObject {
+        functions: functions.iter().map(describe_extracted_function).collect(),
+        bytes,
+    })
+}
+
+fn describe_extracted_function(function: &FunctionImage) -> ExtractedFunction {
+    ExtractedFunction {
+        symbol_name: code_symbol_name(function.va),
+        function_va: function.va,
+        function_len: function.bytes.len() as u64,
+    }
 }
 
 fn describe_discovered_function(function: &FunctionImage) -> DiscoveredFunction {
@@ -1167,108 +1229,149 @@ fn collect_base_relocations(file: &PeFile32<'_>, image_base: u64) -> Result<Vec<
 }
 
 fn write_coff_object(
-    function: &FunctionImage,
+    functions: &[FunctionImage],
     sections: &[ImageSection<'_>],
     base_relocations: &[u64],
-    symbol_name: &str,
 ) -> Result<Vec<u8>> {
-    if !function_is_extractable(function) {
-        return Err(Error::new(format!(
-            "function 0x{:08X} contains control flow that cannot be represented as a standalone COFF object",
-            function.va
-        )));
+    if functions.is_empty() {
+        return Err(Error::new("at least one function is required"));
+    }
+    for function in functions {
+        if !function_is_extractable(function) {
+            return Err(Error::new(format!(
+                "function 0x{:08X} contains control flow that cannot be represented as a standalone COFF object",
+                function.va
+            )));
+        }
     }
 
     let mut object = write::Object::new(BinaryFormat::Coff, Architecture::I386, Endianness::Little);
     object.set_mangling(Mangling::None);
 
     let text = object.section_id(write::StandardSection::Text);
-    object.append_section_data(text, &function.bytes, 16);
-    object.add_symbol(write::Symbol {
-        name: symbol_name.as_bytes().to_vec(),
-        value: 0,
-        size: function.bytes.len() as u64,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Linkage,
-        weak: false,
-        section: write::SymbolSection::Section(text),
-        flags: SymbolFlags::None,
-    });
-
     let mut symbols = HashMap::new();
-    let mut relocated_offsets = HashSet::new();
-
-    for &relocation_va in base_relocations {
-        if !contains_range(function.va, function.bytes.len() as u64, relocation_va, 4) {
-            continue;
-        }
-        let offset = relocation_va - function.va;
-        let target_va = read_u32(&function.bytes, offset as usize)? as u64;
-        let kind = if address_is_text(sections, target_va) {
-            SymbolKind::Text
-        } else {
-            SymbolKind::Data
-        };
-        let symbol = target_symbol(&mut object, &mut symbols, kind, target_va);
-        write_u32(object.section_mut(text).data_mut(), offset as usize, 0)?;
-        object
-            .add_relocation(
-                text,
-                write::Relocation {
-                    offset,
-                    symbol,
-                    addend: 0,
-                    flags: RelocationFlags::Generic {
-                        kind: RelocationKind::Absolute,
-                        encoding: RelocationEncoding::Generic,
-                        size: 32,
-                    },
-                },
-            )
-            .map_err(|err| Error::new(format!("failed to add absolute relocation: {err}")))?;
-        relocated_offsets.insert(offset);
+    let mut layouts = Vec::with_capacity(functions.len());
+    for function in functions {
+        let align = if layouts.is_empty() { 16 } else { 1 };
+        let output_offset = object.append_section_data(text, &function.bytes, align);
+        let symbol = object.add_symbol(write::Symbol {
+            name: code_symbol_name(function.va).into_bytes(),
+            value: output_offset,
+            size: function.bytes.len() as u64,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: write::SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        symbols.insert((SymbolKind::Text, function.va), symbol);
+        layouts.push(FunctionLayout {
+            va: function.va,
+            len: function.bytes.len() as u64,
+            output_offset,
+        });
     }
 
-    for instruction in &function.instructions {
-        let Some(branch) = &instruction.branch else {
-            continue;
-        };
-        if contains_range(function.va, function.bytes.len() as u64, branch.target, 1) {
-            continue;
-        }
-        if branch.operand_size != 4 {
-            return Err(Error::new(format!(
-                "unsupported external branch relocation size {} at 0x{:08X}",
-                branch.operand_size, instruction.va
-            )));
-        }
+    let mut relocated_offsets = HashSet::new();
 
-        let offset = instruction
-            .va
-            .checked_sub(function.va)
-            .and_then(|base| base.checked_add(branch.operand_offset))
-            .ok_or_else(|| Error::new("branch relocation offset underflowed"))?;
-        if !relocated_offsets.insert(offset) {
-            continue;
-        }
+    for (index, function) in functions.iter().enumerate() {
+        let layout = layouts[index];
 
-        let symbol = target_symbol(&mut object, &mut symbols, SymbolKind::Text, branch.target);
-        write_u32(object.section_mut(text).data_mut(), offset as usize, 0)?;
-        object
-            .add_relocation(
-                text,
-                write::Relocation {
-                    offset,
-                    symbol,
-                    addend: -4,
-                    flags: RelocationFlags::Generic {
-                        kind: RelocationKind::Relative,
-                        encoding: RelocationEncoding::Generic,
-                        size: 32,
+        for &relocation_va in base_relocations {
+            if !contains_range(function.va, function.bytes.len() as u64, relocation_va, 4) {
+                continue;
+            }
+            let function_offset = relocation_va - function.va;
+            let object_offset = layout
+                .output_offset
+                .checked_add(function_offset)
+                .ok_or_else(|| Error::new("absolute relocation offset overflowed"))?;
+            let target_va = read_u32(&function.bytes, function_offset as usize)? as u64;
+            let kind = if address_is_text(sections, target_va) {
+                SymbolKind::Text
+            } else {
+                SymbolKind::Data
+            };
+            let symbol = target_symbol(&mut object, &mut symbols, &layouts, text, kind, target_va);
+            write_u32(
+                object.section_mut(text).data_mut(),
+                object_offset as usize,
+                0,
+            )?;
+            object
+                .add_relocation(
+                    text,
+                    write::Relocation {
+                        offset: object_offset,
+                        symbol,
+                        addend: 0,
+                        flags: RelocationFlags::Generic {
+                            kind: RelocationKind::Absolute,
+                            encoding: RelocationEncoding::Generic,
+                            size: 32,
+                        },
                     },
-                },
-            )
-            .map_err(|err| Error::new(format!("failed to add relative relocation: {err}")))?;
+                )
+                .map_err(|err| Error::new(format!("failed to add absolute relocation: {err}")))?;
+            relocated_offsets.insert(object_offset);
+        }
+
+        for instruction in &function.instructions {
+            let Some(branch) = &instruction.branch else {
+                continue;
+            };
+            if contains_range(function.va, function.bytes.len() as u64, branch.target, 1) {
+                continue;
+            }
+            if branch.operand_size != 4 {
+                return Err(Error::new(format!(
+                    "unsupported external branch relocation size {} at 0x{:08X}",
+                    branch.operand_size, instruction.va
+                )));
+            }
+
+            let function_offset = instruction
+                .va
+                .checked_sub(function.va)
+                .and_then(|base| base.checked_add(branch.operand_offset))
+                .ok_or_else(|| Error::new("branch relocation offset underflowed"))?;
+            let object_offset = layout
+                .output_offset
+                .checked_add(function_offset)
+                .ok_or_else(|| Error::new("branch relocation offset overflowed"))?;
+            if !relocated_offsets.insert(object_offset) {
+                continue;
+            }
+
+            let symbol = target_symbol(
+                &mut object,
+                &mut symbols,
+                &layouts,
+                text,
+                SymbolKind::Text,
+                branch.target,
+            );
+            write_u32(
+                object.section_mut(text).data_mut(),
+                object_offset as usize,
+                0,
+            )?;
+            object
+                .add_relocation(
+                    text,
+                    write::Relocation {
+                        offset: object_offset,
+                        symbol,
+                        addend: -4,
+                        flags: RelocationFlags::Generic {
+                            kind: RelocationKind::Relative,
+                            encoding: RelocationEncoding::Generic,
+                            size: 32,
+                        },
+                    },
+                )
+                .map_err(|err| Error::new(format!("failed to add relative relocation: {err}")))?;
+        }
     }
 
     object
@@ -1293,11 +1396,30 @@ fn function_is_extractable(function: &FunctionImage) -> bool {
 fn target_symbol(
     object: &mut write::Object<'_>,
     symbols: &mut HashMap<(SymbolKind, u64), SymbolId>,
+    layouts: &[FunctionLayout],
+    text: write::SectionId,
     kind: SymbolKind,
     va: u64,
 ) -> SymbolId {
     if let Some(symbol) = symbols.get(&(kind, va)) {
         return *symbol;
+    }
+
+    if kind == SymbolKind::Text
+        && let Some(output_offset) = text_output_offset_for_va(layouts, va)
+    {
+        let symbol = object.add_symbol(write::Symbol {
+            name: label_symbol_name(va).into_bytes(),
+            value: output_offset,
+            size: 0,
+            kind: SymbolKind::Label,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        symbols.insert((kind, va), symbol);
+        return symbol;
     }
 
     let name = match kind {
@@ -1316,6 +1438,15 @@ fn target_symbol(
     });
     symbols.insert((kind, va), symbol);
     symbol
+}
+
+fn text_output_offset_for_va(layouts: &[FunctionLayout], va: u64) -> Option<u64> {
+    layouts.iter().find_map(|layout| {
+        let relative = va.checked_sub(layout.va)?;
+        (relative < layout.len)
+            .then(|| layout.output_offset.checked_add(relative))
+            .flatten()
+    })
 }
 
 fn contains_range(start: u64, len: u64, address: u64, size: u64) -> bool {
@@ -1355,6 +1486,10 @@ fn code_symbol_name(va: u64) -> String {
 
 fn data_symbol_name(va: u64) -> String {
     format!("data_{va:08X}")
+}
+
+fn label_symbol_name(va: u64) -> String {
+    format!("label_{va:08X}")
 }
 
 #[cfg(test)]

@@ -52,11 +52,19 @@ fn help_describes_discovery_and_single_function_modes() {
     );
     assert_contains(
         &stdout,
+        "unlink input.exe --address 0x401000 --address 0x401050 -o selected.obj",
+    );
+    assert_contains(
+        &stdout,
         "Without --address, -o/--output is an output directory",
     );
     assert_contains(
         &stdout,
-        "With --address, -o/--output is the object file path",
+        "With one --address, -o/--output is the object file path",
+    );
+    assert_contains(
+        &stdout,
+        "With multiple --address values, -o/--output is required",
     );
 }
 
@@ -191,6 +199,27 @@ fn single_function_extraction_accepts_va_and_rva() {
     let rva_output = build.dir.join("single-rva.obj");
     run_unlink_address(&build.exe, rva, &rva_output);
     assert_objdiff_symbol_matches(&rva_output, &build.obj, &format_code_symbol(va), symbol);
+}
+
+#[test]
+fn multi_function_extraction_writes_one_object_with_all_symbols() {
+    let build = compile_fixture("basic.cpp");
+    let symbols = [
+        "_fixture_no_refs",
+        "_fixture_calls_function",
+        "_fixture_uses_global",
+    ];
+    let addresses = symbols
+        .iter()
+        .map(|symbol| linked_va_for_source_symbol(&build, symbol))
+        .collect::<Vec<_>>();
+    let output = build.dir.join("selected.obj");
+
+    run_unlink_addresses(&build.exe, &addresses, &output);
+
+    for (address, symbol) in addresses.iter().zip(symbols) {
+        assert_objdiff_symbol_matches(&output, &build.obj, &format_code_symbol(*address), symbol);
+    }
 }
 
 #[test]
@@ -478,6 +507,20 @@ fn run_unlink_address(exe: &Path, address: u64, output_obj: &Path) {
         .output()
         .expect("failed to run unlink address extraction");
     assert_success("run unlink address extraction", &output);
+}
+
+fn run_unlink_addresses(exe: &Path, addresses: &[u64], output_obj: &Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_unlink"));
+    command.arg(exe);
+    for address in addresses {
+        command.arg("--address").arg(format!("0x{address:X}"));
+    }
+    let output = command
+        .arg("-o")
+        .arg(output_obj)
+        .output()
+        .expect("failed to run unlink multi-address extraction");
+    assert_success("run unlink multi-address extraction", &output);
 }
 
 fn run_unres(exe: &Path, output_rc: &Path) {

@@ -12,13 +12,15 @@ executables. It currently builds two sibling CLI tools:
 The current implementation is an MVP for extracting functions from PE32/i386 images:
 
 - CLI: `unlink <input.exe> --address <addr> [-o <output.obj>]`
+- CLI: `unlink <input.exe> --address <addr> --address <addr>... -o <output.obj>`
 - CLI: `unlink <input.exe> [-o <output-dir>]`
-- Library entrypoint: `extract_function_object(image, requested_address)`
+- Library entrypoints: `extract_function_object(image, requested_address)` and `extract_functions_object(image, requested_addresses)`
 - Library entrypoints: `discover_function_addresses(image)` and `extract_function_objects(image)`
 - Address parsing accepts decimal and `0x`/`0X` hex.
 - Addresses below the PE image base are treated as RVAs; addresses at or above image base are treated as VAs.
 - Only PE32/i386 is supported.
 - Omitting `--address` discovers functions automatically and writes one `sub_XXXXXXXX.obj` per function. In automatic mode, `-o/--output` is an output directory.
+- Passing multiple `--address` values writes one COFF object containing all requested functions. In this mode, `-o/--output` is required and names the object file.
 - Resource extraction accepts PE32 and PE32+ inputs.
 
 Local test tools live under `tests/tools/`.
