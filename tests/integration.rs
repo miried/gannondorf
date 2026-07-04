@@ -85,6 +85,45 @@ fn missing_args_prints_usage_hints() {
 }
 
 #[test]
+fn cxxunlink_extracts_addresses_from_annotated_source() {
+    let build = compile_fixture("basic.cpp");
+    let source_symbols = [
+        "_fixture_no_refs",
+        "_fixture_calls_function",
+        "_fixture_uses_global",
+    ];
+    let addresses = source_symbols
+        .iter()
+        .map(|symbol| linked_va_for_source_symbol(&build, symbol))
+        .collect::<Vec<_>>();
+    let mapping_source = build.dir.join("mapping.cpp");
+    fs::write(
+        &mapping_source,
+        format!(
+            "//! FILE basic.exe\n\
+             \n\
+             //! FUNC 0x{:08X}\n\
+             extern \"C\" int fixture_no_refs(int value);\n\
+             \n\
+             //! FUNC 0x{:08X}\n\
+             extern \"C\" int fixture_calls_function(int value);\n\
+             \n\
+             //! FUNC 0x{:08X}\n\
+             extern \"C\" int fixture_uses_global(int value);\n",
+            addresses[0], addresses[1], addresses[2]
+        ),
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", mapping_source.display()));
+    let output = build.dir.join("mapped.obj");
+
+    run_cxxunlink(&mapping_source, &build.dir, &output);
+
+    for (address, symbol) in addresses.iter().zip(source_symbols) {
+        assert_objdiff_symbol_matches(&output, &build.obj, &format_code_symbol(*address), symbol);
+    }
+}
+
+#[test]
 fn unres_extracts_resources_to_msvc_resource_script() {
     let build = compile_resource_fixture();
     let generated_rc = build.dir.join("resources.rc");
@@ -521,6 +560,17 @@ fn run_unlink_addresses(exe: &Path, addresses: &[u64], output_obj: &Path) {
         .output()
         .expect("failed to run unlink multi-address extraction");
     assert_success("run unlink multi-address extraction", &output);
+}
+
+fn run_cxxunlink(source: &Path, binary_dir: &Path, output_obj: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_cxxunlink"))
+        .arg(source)
+        .arg(binary_dir)
+        .arg("-o")
+        .arg(output_obj)
+        .output()
+        .expect("failed to run cxxunlink");
+    assert_success("run cxxunlink extraction", &output);
 }
 
 fn run_unres(exe: &Path, output_rc: &Path) {

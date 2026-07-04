@@ -1,10 +1,13 @@
 # Gannondorf
 
 Gannondorf is a Rust project for pulling apart Win32 PE executables. It builds
-two sibling command-line tools:
+several sibling command-line tools:
 
 - `unlink` extracts discovered functions into isolated COFF object files,
   creating relocations where necessary.
+- `cxxmap` extracts binary/function address mappings from annotated C++ source.
+- `cxxunlink` parses those source annotations and extracts the mapped functions
+  from the annotated binary.
 - `unres` extracts PE resources into an MSVC-compatible resource script,
   generated header, and sidecar asset files.
 
@@ -26,6 +29,30 @@ When `--address` is omitted, `unlink` discovers PE32/i386 functions automaticall
 
 ```sh
 unlink input.exe -o extracted-objects
+```
+
+## `cxxmap` and `cxxunlink`
+
+Annotated source files can name the target executable and function addresses:
+
+```cpp
+//! FILE TI.EXE
+
+//! FUNC 0x0041bb40
+void fn_0041bb40();
+```
+
+`cxxmap` prints the parsed mapping:
+
+```sh
+cxxmap tests/mapping_test.cpp
+```
+
+`cxxunlink` resolves the `FILE` annotation under a binary directory and writes a
+combined object for every mapped function address:
+
+```sh
+cxxunlink tests/mapping_test.cpp tests/bin -o mapped.obj
 ```
 
 ## `unres`
