@@ -1,4 +1,4 @@
-# Test review: `tests/` (unlink)
+# Test review: `tests/` (gannondorf)
 
 Date: 2026-06-18
 Scope: `tests/integration.rs`, `tests/fixtures/`

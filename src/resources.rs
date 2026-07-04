@@ -9,7 +9,7 @@ use object::read::pe::{
     ResourceDirectoryTable, ResourceNameOrId,
 };
 
-use crate::{Result, UnlinkError};
+use crate::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedResources {
@@ -76,19 +76,19 @@ struct ResourceDefinition {
 
 pub fn extract_resource_script(image: &[u8], asset_dir_name: &str) -> Result<ExtractedResources> {
     match FileKind::parse(image)
-        .map_err(|err| UnlinkError::new(format!("failed to identify input file: {err}")))?
+        .map_err(|err| Error::new(format!("failed to identify input file: {err}")))?
     {
         FileKind::Pe32 => {
             let file = PeFile32::parse(image)
-                .map_err(|err| UnlinkError::new(format!("failed to parse PE32 image: {err}")))?;
+                .map_err(|err| Error::new(format!("failed to parse PE32 image: {err}")))?;
             extract_pe_resource_script(&file, asset_dir_name)
         }
         FileKind::Pe64 => {
             let file = PeFile64::parse(image)
-                .map_err(|err| UnlinkError::new(format!("failed to parse PE32+ image: {err}")))?;
+                .map_err(|err| Error::new(format!("failed to parse PE32+ image: {err}")))?;
             extract_pe_resource_script(&file, asset_dir_name)
         }
-        kind => Err(UnlinkError::new(format!(
+        kind => Err(Error::new(format!(
             "unsupported input file kind {kind:?}; only PE32 and PE32+ resources are implemented"
         ))),
     }
@@ -104,14 +104,14 @@ where
     let Some(directory) = file
         .data_directories()
         .resource_directory(file.data(), &file.section_table())
-        .map_err(|err| UnlinkError::new(format!("failed to read PE resources: {err}")))?
+        .map_err(|err| Error::new(format!("failed to read PE resources: {err}")))?
     else {
         return Ok(ResourceRenderer::new(asset_dir_name).finish());
     };
 
     let root = directory
         .root()
-        .map_err(|err| UnlinkError::new(format!("failed to parse PE resource root: {err}")))?;
+        .map_err(|err| Error::new(format!("failed to parse PE resource root: {err}")))?;
     let leaves = collect_resource_leaves(file, directory, &root)?;
     render_resource_script(&leaves, asset_dir_name)
 }
@@ -160,7 +160,7 @@ fn resource_key(
         ResourceNameOrId::Name(name) => name
             .to_string_lossy(directory)
             .map(ResourceKey::Name)
-            .map_err(|err| UnlinkError::new(format!("failed to decode resource name: {err}"))),
+            .map_err(|err| Error::new(format!("failed to decode resource name: {err}"))),
     }
 }
 
@@ -170,7 +170,7 @@ fn resource_language_id(
 ) -> Result<u16> {
     match resource_key(name_or_id, directory)? {
         ResourceKey::Id(id) => Ok(id),
-        ResourceKey::Name(name) => Err(UnlinkError::new(format!(
+        ResourceKey::Name(name) => Err(Error::new(format!(
             "unsupported named resource language `{name}`"
         ))),
     }
@@ -183,10 +183,10 @@ fn entry_table<'data>(
 ) -> Result<ResourceDirectoryTable<'data>> {
     match entry
         .data(directory)
-        .map_err(|err| UnlinkError::new(format!("failed to read {context} table: {err}")))?
+        .map_err(|err| Error::new(format!("failed to read {context} table: {err}")))?
     {
         ResourceDirectoryEntryData::Table(table) => Ok(table),
-        ResourceDirectoryEntryData::Data(_) => Err(UnlinkError::new(format!(
+        ResourceDirectoryEntryData::Data(_) => Err(Error::new(format!(
             "malformed PE resources: {context} entry points directly to data"
         ))),
     }
@@ -199,10 +199,10 @@ fn entry_data<'data>(
 ) -> Result<&'data pe::ImageResourceDataEntry> {
     match entry
         .data(directory)
-        .map_err(|err| UnlinkError::new(format!("failed to read {context} data: {err}")))?
+        .map_err(|err| Error::new(format!("failed to read {context} data: {err}")))?
     {
         ResourceDirectoryEntryData::Data(data) => Ok(data),
-        ResourceDirectoryEntryData::Table(_) => Err(UnlinkError::new(format!(
+        ResourceDirectoryEntryData::Table(_) => Err(Error::new(format!(
             "malformed PE resources: {context} entry points to another table"
         ))),
     }
@@ -221,7 +221,7 @@ where
         .pe_data_at(file.data(), rva)
         .and_then(|bytes| bytes.get(..size))
         .ok_or_else(|| {
-            UnlinkError::new(format!(
+            Error::new(format!(
                 "resource data at RVA 0x{rva:08X} with size 0x{size:X} is outside section data"
             ))
         })
@@ -371,10 +371,10 @@ impl ResourceDefinitions {
     }
 
     fn define(&mut self, name: String, value: u32) -> String {
-        if let Some(existing) = self.values_by_name.get(&name) {
-            if *existing == value {
-                return name;
-            }
+        if let Some(existing) = self.values_by_name.get(&name)
+            && *existing == value
+        {
+            return name;
         }
 
         let base_name = name;
@@ -588,7 +588,7 @@ fn build_icon_file(
     for entry in &entries {
         let resource = images
             .get(&(group.language, entry.id))
-            .ok_or_else(|| UnlinkError::new("group resource references a missing image"))?;
+            .ok_or_else(|| Error::new("group resource references a missing image"))?;
         let (directory_prefix, payload) = match kind {
             IconFileKind::Icon => (entry.directory_prefix, (*resource).to_vec()),
             IconFileKind::Cursor => {
@@ -605,7 +605,7 @@ fn build_icon_file(
         write_u32(&mut output, image_offset);
         image_offset = image_offset
             .checked_add(payload_size)
-            .ok_or_else(|| UnlinkError::new("icon/cursor file offsets overflowed"))?;
+            .ok_or_else(|| Error::new("icon/cursor file offsets overflowed"))?;
         payloads.push(payload);
         consumed.push((group.language, entry.id));
     }
@@ -618,21 +618,17 @@ fn build_icon_file(
 
 fn parse_group_entries(data: &[u8], kind: IconFileKind) -> Result<Vec<GroupEntry>> {
     if data.len() < 6 {
-        return Err(UnlinkError::new(
-            "group resource is shorter than its header",
-        ));
+        return Err(Error::new("group resource is shorter than its header"));
     }
     if read_u16_at(data, 0)? != 0 {
-        return Err(UnlinkError::new(
-            "group resource reserved field is non-zero",
-        ));
+        return Err(Error::new("group resource reserved field is non-zero"));
     }
     let expected_type = match kind {
         IconFileKind::Icon => 1,
         IconFileKind::Cursor => 2,
     };
     if read_u16_at(data, 2)? != expected_type {
-        return Err(UnlinkError::new("group resource has an unexpected type"));
+        return Err(Error::new("group resource has an unexpected type"));
     }
 
     let count = read_u16_at(data, 4)? as usize;
@@ -640,13 +636,11 @@ fn parse_group_entries(data: &[u8], kind: IconFileKind) -> Result<Vec<GroupEntry
         .checked_add(
             count
                 .checked_mul(14)
-                .ok_or_else(|| UnlinkError::new("group resource entry count overflowed"))?,
+                .ok_or_else(|| Error::new("group resource entry count overflowed"))?,
         )
-        .ok_or_else(|| UnlinkError::new("group resource size overflowed"))?;
+        .ok_or_else(|| Error::new("group resource size overflowed"))?;
     if data.len() < expected_len {
-        return Err(UnlinkError::new(
-            "group resource is shorter than its entry table",
-        ));
+        return Err(Error::new("group resource is shorter than its entry table"));
     }
 
     let mut entries = Vec::with_capacity(count);
@@ -676,9 +670,7 @@ fn parse_group_entries(data: &[u8], kind: IconFileKind) -> Result<Vec<GroupEntry
 
 fn cursor_payload_for_cur_file(resource: &[u8]) -> Result<([u8; 4], Vec<u8>)> {
     if resource.len() < 4 {
-        return Err(UnlinkError::new(
-            "cursor resource is shorter than its hotspot",
-        ));
+        return Err(Error::new("cursor resource is shorter than its hotspot"));
     }
     let mut hotspot = [0u8; 4];
     hotspot.copy_from_slice(&resource[..4]);
@@ -693,13 +685,13 @@ fn parse_string_table_block(data: &[u8]) -> Result<Vec<Option<Vec<u16>>>> {
         offset += 2;
         let byte_len = len
             .checked_mul(2)
-            .ok_or_else(|| UnlinkError::new("string table entry length overflowed"))?;
+            .ok_or_else(|| Error::new("string table entry length overflowed"))?;
         let end = offset
             .checked_add(byte_len)
-            .ok_or_else(|| UnlinkError::new("string table entry end overflowed"))?;
+            .ok_or_else(|| Error::new("string table entry end overflowed"))?;
         let bytes = data
             .get(offset..end)
-            .ok_or_else(|| UnlinkError::new("string table entry extends past resource data"))?;
+            .ok_or_else(|| Error::new("string table entry extends past resource data"))?;
         if len == 0 {
             strings.push(None);
         } else {
@@ -718,7 +710,7 @@ fn parse_string_table_block(data: &[u8]) -> Result<Vec<Option<Vec<u16>>>> {
 fn read_u16_at(data: &[u8], offset: usize) -> Result<u16> {
     let bytes = data
         .get(offset..offset + 2)
-        .ok_or_else(|| UnlinkError::new("unexpected end of resource data"))?;
+        .ok_or_else(|| Error::new("unexpected end of resource data"))?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
@@ -944,14 +936,14 @@ fn render_menu_resource(
 ) -> Result<String> {
     let data = leaf.data;
     if read_u16_at(data, 0)? != 0 {
-        return Err(UnlinkError::new("extended menus are not implemented"));
+        return Err(Error::new("extended menus are not implemented"));
     }
     let header_size = read_u16_at(data, 2)? as usize;
     let mut offset = 4usize
         .checked_add(header_size)
-        .ok_or_else(|| UnlinkError::new("menu header size overflowed"))?;
+        .ok_or_else(|| Error::new("menu header size overflowed"))?;
     if offset > data.len() {
-        return Err(UnlinkError::new("menu header extends past resource data"));
+        return Err(Error::new("menu header extends past resource data"));
     }
 
     let items = parse_menu_items(data, &mut offset)?;
@@ -968,7 +960,7 @@ fn parse_menu_items(data: &[u8], offset: &mut usize) -> Result<Vec<MenuItem>> {
     let mut items = Vec::new();
     loop {
         if *offset >= data.len() {
-            return Err(UnlinkError::new("menu item list is missing an end marker"));
+            return Err(Error::new("menu item list is missing an end marker"));
         }
 
         let flags = read_u16_at(data, *offset)?;
@@ -1030,12 +1022,10 @@ fn render_menu_item(
 
     let id = item
         .id
-        .ok_or_else(|| UnlinkError::new("non-popup menu item is missing an id"))?;
+        .ok_or_else(|| Error::new("non-popup menu item is missing an id"))?;
     if item.flags & MENU_SEPARATOR != 0 {
         if id != 0 || !item.text.is_empty() {
-            return Err(UnlinkError::new(
-                "separator menu item has unexpected id or text",
-            ));
+            return Err(Error::new("separator menu item has unexpected id or text"));
         }
         output.push_str(&format!("{indent_text}MENUITEM SEPARATOR\n"));
         return Ok(());
@@ -1053,7 +1043,7 @@ fn render_menu_item(
 
 fn menu_option_suffix(flags: u16) -> Result<String> {
     if flags & (MENU_BITMAP | MENU_OWNERDRAW) != 0 {
-        return Err(UnlinkError::new(
+        return Err(Error::new(
             "bitmap and owner-drawn menu items are not implemented",
         ));
     }
@@ -1070,7 +1060,7 @@ fn menu_option_suffix(flags: u16) -> Result<String> {
         MENU_GRAYED | MENU_INACTIVE | MENU_CHECKED | MENU_MENUBARBREAK | MENU_MENUBREAK | MENU_HELP;
     let unknown = flags & !known;
     if unknown != 0 {
-        return Err(UnlinkError::new(format!(
+        return Err(Error::new(format!(
             "unsupported menu option flags 0x{unknown:04X}"
         )));
     }
@@ -1122,7 +1112,7 @@ fn render_dialog_resource(
 
 fn parse_dialog_template(data: &[u8]) -> Result<DialogTemplate> {
     if read_u16_at(data, 0)? == 1 && read_u16_at(data, 2)? == 0xFFFF {
-        return Err(UnlinkError::new("DIALOGEX resources are not implemented"));
+        return Err(Error::new("DIALOGEX resources are not implemented"));
     }
 
     let style = read_u32_at(data, 0)?;
@@ -1166,12 +1156,12 @@ fn parse_dialog_template(data: &[u8]) -> Result<DialogTemplate> {
         offset += 2;
         let extra_end = offset
             .checked_add(extra_size)
-            .ok_or_else(|| UnlinkError::new("dialog control extra data size overflowed"))?;
+            .ok_or_else(|| Error::new("dialog control extra data size overflowed"))?;
         let extra = data
             .get(offset..extra_end)
-            .ok_or_else(|| UnlinkError::new("dialog control extra data extends past resource"))?;
+            .ok_or_else(|| Error::new("dialog control extra data extends past resource"))?;
         if !extra.is_empty() {
-            return Err(UnlinkError::new(
+            return Err(Error::new(
                 "dialog control creation data is not implemented",
             ));
         }
@@ -1235,7 +1225,7 @@ fn render_accelerator_resource(
     definitions: &mut ResourceDefinitions,
 ) -> Result<String> {
     if !leaf.data.len().is_multiple_of(8) {
-        return Err(UnlinkError::new(
+        return Err(Error::new(
             "accelerator resource size is not a multiple of entry size",
         ));
     }
@@ -1250,10 +1240,10 @@ fn render_accelerator_resource(
         let id = read_u16_at(leaf.data, offset + 4)?;
         let padding = read_u16_at(leaf.data, offset + 6)?;
         if padding != 0 {
-            return Err(UnlinkError::new("accelerator padding is non-zero"));
+            return Err(Error::new("accelerator padding is non-zero"));
         }
         if (flags & ACCEL_LAST != 0) != (index + 1 == entry_count) {
-            return Err(UnlinkError::new(
+            return Err(Error::new(
                 "accelerator last-entry marker is not on the final entry",
             ));
         }
@@ -1284,7 +1274,7 @@ fn accelerator_options(flags: u16) -> Result<String> {
     let known = ACCEL_VIRTKEY | ACCEL_NOINVERT | ACCEL_SHIFT | ACCEL_CONTROL | ACCEL_ALT;
     let unknown = flags & !known;
     if unknown != 0 {
-        return Err(UnlinkError::new(format!(
+        return Err(Error::new(format!(
             "unsupported accelerator flags 0x{unknown:04X}"
         )));
     }
@@ -1309,7 +1299,7 @@ fn dialog_control_title(value: &DialogValue) -> Result<String> {
 
 fn dialog_control_class(value: &DialogValue) -> Result<String> {
     match value {
-        DialogValue::None => Err(UnlinkError::new("dialog control is missing its class")),
+        DialogValue::None => Err(Error::new("dialog control is missing its class")),
         DialogValue::String(text) => Ok(format!("\"{}\"", escape_rc_utf16_string(text))),
         DialogValue::Ordinal(0x80) => Ok("\"BUTTON\"".to_owned()),
         DialogValue::Ordinal(0x81) => Ok("\"EDIT\"".to_owned()),
@@ -1317,7 +1307,7 @@ fn dialog_control_class(value: &DialogValue) -> Result<String> {
         DialogValue::Ordinal(0x83) => Ok("\"LISTBOX\"".to_owned()),
         DialogValue::Ordinal(0x84) => Ok("\"SCROLLBAR\"".to_owned()),
         DialogValue::Ordinal(0x85) => Ok("\"COMBOBOX\"".to_owned()),
-        DialogValue::Ordinal(id) => Err(UnlinkError::new(format!(
+        DialogValue::Ordinal(id) => Err(Error::new(format!(
             "unsupported dialog control class ordinal 0x{id:04X}"
         ))),
     }
@@ -1356,24 +1346,24 @@ fn read_utf16z(data: &[u8], offset: &mut usize) -> Result<Vec<u16>> {
 fn read_i16_at(data: &[u8], offset: usize) -> Result<i16> {
     let bytes = data
         .get(offset..offset + 2)
-        .ok_or_else(|| UnlinkError::new("unexpected end of resource data"))?;
+        .ok_or_else(|| Error::new("unexpected end of resource data"))?;
     Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_u32_at(data: &[u8], offset: usize) -> Result<u32> {
     let bytes = data
         .get(offset..offset + 4)
-        .ok_or_else(|| UnlinkError::new("unexpected end of resource data"))?;
+        .ok_or_else(|| Error::new("unexpected end of resource data"))?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn align_offset(data: &[u8], offset: &mut usize) -> Result<()> {
     *offset = offset
         .checked_add(3)
-        .ok_or_else(|| UnlinkError::new("resource offset overflowed"))?
+        .ok_or_else(|| Error::new("resource offset overflowed"))?
         & !3;
     if *offset > data.len() {
-        return Err(UnlinkError::new("resource alignment skipped past data"));
+        return Err(Error::new("resource alignment skipped past data"));
     }
     Ok(())
 }
@@ -1385,7 +1375,7 @@ fn reject_nonzero_trailing_data(data: &[u8], offset: usize, context: &str) -> Re
     {
         Ok(())
     } else {
-        Err(UnlinkError::new(format!(
+        Err(Error::new(format!(
             "{context} resource has trailing non-zero data"
         )))
     }

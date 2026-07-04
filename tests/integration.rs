@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gannondorf::discover_functions;
 use iced_x86::{Decoder, DecoderOptions};
 use object::SymbolKind;
 use object::endian::LittleEndian as LE;
@@ -18,7 +19,6 @@ use object::read::pe::{
 };
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use serde_json::Value;
-use unlink::discover_functions;
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();

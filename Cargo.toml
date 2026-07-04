@@ -1,7 +1,15 @@
 [package]
-name = "unlink"
+name = "gannondorf"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "unlink"
+path = "src/bin/unlink.rs"
+
+[[bin]]
+name = "unres"
+path = "src/bin/unres.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

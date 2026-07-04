@@ -2,7 +2,12 @@
 
 ## Current State
 
-This repo is a Rust prototype for extracting functions from Win32 PE executables into standalone COFF object files.
+This repo is the `gannondorf` Rust prototype for pulling apart Win32 PE
+executables. It currently builds two sibling CLI tools:
+
+- `unlink`, for extracting functions into standalone COFF object files.
+- `unres`, for extracting PE resources into MSVC-compatible `.rc` output,
+  generated `resources.h` definitions, and sidecar asset files.
 
 The current implementation is an MVP for extracting functions from PE32/i386 images:
 
@@ -14,12 +19,13 @@ The current implementation is an MVP for extracting functions from PE32/i386 ima
 - Addresses below the PE image base are treated as RVAs; addresses at or above image base are treated as VAs.
 - Only PE32/i386 is supported.
 - Omitting `--address` discovers functions automatically and writes one `sub_XXXXXXXX.obj` per function. In automatic mode, `-o/--output` is an output directory.
+- Resource extraction accepts PE32 and PE32+ inputs.
 
 Local test tools live under `tests/tools/`.
 
 ## Implemented Behavior
 
-Core implementation is in `src/lib.rs`.
+Function extraction is implemented in `src/functions.rs`.
 
 - Parses PE32 with `object::read::pe::PeFile32`.
 - Validates architecture is `Architecture::I386`.
@@ -44,7 +50,14 @@ Core implementation is in `src/lib.rs`.
     - `sub_XXXXXXXX` for external code references.
     - `data_XXXXXXXX` for external data references.
 
-CLI implementation is in `src/main.rs`.
+Resource extraction is implemented in `src/resources.rs`.
+
+- Parses the PE resource tree for PE32 and PE32+ images.
+- Renders an MSVC-compatible `.rc` script and generated `resources.h`.
+- Rebuilds icon/cursor group resources into `.ico`/`.cur` sidecar assets.
+- Emits sidecar files for raw resource payloads.
+
+CLI implementations are in `src/bin/unlink.rs` and `src/bin/unres.rs`.
 
 Dependencies of note:
 
@@ -64,7 +77,7 @@ cargo clippy --all-targets -- -D warnings
 CLI smoke tests performed:
 
 ```sh
-cargo run -- tests/TEST00.exe --address 0x401035 -o /tmp/unlink-test.obj
+cargo run --bin unlink -- tests/TEST00.exe --address 0x401035 -o /tmp/unlink-test.obj
 llvm-readobj --sections --symbols --relocations /tmp/unlink-test.obj
 ```
 
@@ -75,7 +88,7 @@ Observed expected result:
   - `0xB IMAGE_REL_I386_REL32 sub_00401000`
 
 ```sh
-cargo run -- tests/TEST00.exe --address 0x401017 -o /tmp/unlink-global.obj
+cargo run --bin unlink -- tests/TEST00.exe --address 0x401017 -o /tmp/unlink-global.obj
 llvm-readobj --sections --symbols --relocations /tmp/unlink-global.obj
 ```
 
@@ -89,7 +102,7 @@ Observed expected result:
 Automatic discovery smoke test performed:
 
 ```sh
-cargo run -- tests/TEST00.exe -o /tmp/unlink-auto-test
+cargo run --bin unlink -- tests/TEST00.exe -o /tmp/unlink-auto-test
 llvm-readobj --file-headers --sections --symbols --relocations /tmp/unlink-auto-test/sub_004010C0.obj
 ```
 
@@ -99,12 +112,13 @@ Observed expected result:
 - Entry object `sub_004010C0.obj` is COFF-i386.
 - Entry object has `.text` relocations for external code and data references.
 
-Unit tests in `src/lib.rs` cover pure helpers:
+Unit tests in `src/functions.rs` and `src/resources.rs` cover pure helpers:
 
 - Address parsing.
 - Default output naming.
 - RVA-to-VA normalization.
 - Range containment boundaries.
+- Resource rendering and parsing helpers.
 
 Integration tests in `tests/integration.rs` cover the fixture-level flow:
 
@@ -156,8 +170,11 @@ Integration tests in `tests/integration.rs` cover the fixture-level flow:
 ## Useful Files
 
 - `README.md`: original project goal.
-- `src/lib.rs`: extraction logic and tests.
-- `src/main.rs`: CLI.
+- `src/lib.rs`: shared crate facade and public error/result types.
+- `src/functions.rs`: function extraction logic and tests.
+- `src/resources.rs`: resource extraction logic and tests.
+- `src/bin/unlink.rs`: function extraction CLI.
+- `src/bin/unres.rs`: resource extraction CLI.
 - `tests/fixtures/basic.cpp`: source fixture for no-ref, data-reloc, and call-reloc checks.
 - `tests/fixtures/control_flow.cpp`: source fixture for conditional, loop, and nested-branch checks.
 - `tests/integration.rs`: compiles fixtures, runs `unlink`, and compares with `objdiff`.

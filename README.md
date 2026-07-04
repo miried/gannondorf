@@ -1,6 +1,14 @@
-# unlink
+# Gannondorf
 
-This tool takes a Win32 PE executable as input and extracts discovered functions into isolated COFF object files, creating relocations where necessary.
+Gannondorf is a Rust project for pulling apart Win32 PE executables. It builds
+two sibling command-line tools:
+
+- `unlink` extracts discovered functions into isolated COFF object files,
+  creating relocations where necessary.
+- `unres` extracts PE resources into an MSVC-compatible resource script,
+  generated header, and sidecar asset files.
+
+## `unlink`
 
 To extract one known function:
 
@@ -13,6 +21,8 @@ When `--address` is omitted, `unlink` discovers PE32/i386 functions automaticall
 ```sh
 unlink input.exe -o extracted-objects
 ```
+
+## `unres`
 
 To extract PE resources into an MSVC resource script:
 

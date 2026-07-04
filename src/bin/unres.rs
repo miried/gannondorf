@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use unlink::{Result, UnlinkError, extract_resource_script};
+use gannondorf::{Error, Result, extract_resource_script};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,15 +37,14 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    let input = fs::read(&args.input).map_err(|err| {
-        UnlinkError::new(format!("failed to read `{}`: {err}", args.input.display()))
-    })?;
+    let input = fs::read(&args.input)
+        .map_err(|err| Error::new(format!("failed to read `{}`: {err}", args.input.display())))?;
 
     let output = args.output.unwrap_or_else(default_output_path);
     let output_dir = output.parent().filter(|path| !path.as_os_str().is_empty());
     if let Some(output_dir) = output_dir {
         fs::create_dir_all(output_dir).map_err(|err| {
-            UnlinkError::new(format!(
+            Error::new(format!(
                 "failed to create output directory `{}`: {err}",
                 output_dir.display()
             ))
@@ -61,22 +60,20 @@ fn run() -> Result<()> {
         let path = asset_write_base.join(&asset.relative_path);
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(|err| {
-                UnlinkError::new(format!(
+                Error::new(format!(
                     "failed to create asset directory `{}`: {err}",
                     parent.display()
                 ))
             })?;
         }
-        fs::write(&path, &asset.bytes).map_err(|err| {
-            UnlinkError::new(format!("failed to write `{}`: {err}", path.display()))
-        })?;
+        fs::write(&path, &asset.bytes)
+            .map_err(|err| Error::new(format!("failed to write `{}`: {err}", path.display())))?;
     }
 
-    fs::write(&output, extracted.rc_text).map_err(|err| {
-        UnlinkError::new(format!("failed to write `{}`: {err}", output.display()))
-    })?;
+    fs::write(&output, extracted.rc_text)
+        .map_err(|err| Error::new(format!("failed to write `{}`: {err}", output.display())))?;
     fs::write(&header_output, extracted.header_text).map_err(|err| {
-        UnlinkError::new(format!(
+        Error::new(format!(
             "failed to write `{}`: {err}",
             header_output.display()
         ))
