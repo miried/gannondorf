@@ -1,4 +1,0 @@
---include-directory=/Users/wombat/projects/decomp/gannondorf/tests/tools/MSDEV/INCLUDE
--fms-extensions
--D_WIN32
--D_M_IX86
