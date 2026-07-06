@@ -35,6 +35,7 @@ struct ResourceLeaf<'data> {
     typ: ResourceKey,
     name: ResourceKey,
     language: u16,
+    data_rva: u32,
     data: &'data [u8],
 }
 
@@ -134,20 +135,20 @@ where
             for language_entry in language_table.entries {
                 let language = resource_language_id(language_entry.name_or_id(), directory)?;
                 let data_entry = entry_data(language_entry, directory, "resource language")?;
+                let data_rva = data_entry.offset_to_data.get(LE);
                 let data = resource_data(file, data_entry)?;
                 leaves.push(ResourceLeaf {
                     typ: typ.clone(),
                     name: name.clone(),
                     language,
+                    data_rva,
                     data,
                 });
             }
         }
     }
 
-    leaves.sort_by(|left, right| {
-        (&left.typ, &left.name, left.language).cmp(&(&right.typ, &right.name, right.language))
-    });
+    leaves.sort_by_key(|leaf| leaf.data_rva);
     Ok(leaves)
 }
 
@@ -234,44 +235,26 @@ fn render_resource_script(
     let mut renderer = ResourceRenderer::new(asset_dir_name);
     let image_resources = collect_numeric_resources(leaves, pe::RT_ICON);
     let cursor_resources = collect_numeric_resources(leaves, pe::RT_CURSOR);
-    let mut handled = BTreeSet::new();
+    let mut icon_or_cursor_groups = BTreeMap::new();
     let mut consumed_images = BTreeSet::new();
     let mut consumed_cursors = BTreeSet::new();
 
     for (index, leaf) in leaves.iter().enumerate() {
-        if leaf.typ == ResourceKey::Id(pe::RT_STRING)
-            && renderer.try_render_string_table(leaf).unwrap_or(false)
-        {
-            handled.insert(index);
-        }
-    }
-
-    for (index, leaf) in leaves.iter().enumerate() {
         match leaf.typ {
             ResourceKey::Id(pe::RT_GROUP_ICON) => {
-                match build_icon_file(leaf, IconFileKind::Icon, &image_resources) {
-                    Ok((bytes, image_ids)) => {
-                        renderer.render_icon_or_cursor(leaf, IconFileKind::Icon, bytes)?;
-                        handled.insert(index);
-                        consumed_images.extend(image_ids);
-                    }
-                    Err(_) => {
-                        renderer.render_raw_resource(leaf)?;
-                        handled.insert(index);
-                    }
+                if let Ok((bytes, image_ids)) =
+                    build_icon_file(leaf, IconFileKind::Icon, &image_resources)
+                {
+                    consumed_images.extend(image_ids.iter().copied());
+                    icon_or_cursor_groups.insert(index, (IconFileKind::Icon, bytes));
                 }
             }
             ResourceKey::Id(pe::RT_GROUP_CURSOR) => {
-                match build_icon_file(leaf, IconFileKind::Cursor, &cursor_resources) {
-                    Ok((bytes, cursor_ids)) => {
-                        renderer.render_icon_or_cursor(leaf, IconFileKind::Cursor, bytes)?;
-                        handled.insert(index);
-                        consumed_cursors.extend(cursor_ids);
-                    }
-                    Err(_) => {
-                        renderer.render_raw_resource(leaf)?;
-                        handled.insert(index);
-                    }
+                if let Ok((bytes, cursor_ids)) =
+                    build_icon_file(leaf, IconFileKind::Cursor, &cursor_resources)
+                {
+                    consumed_cursors.extend(cursor_ids.iter().copied());
+                    icon_or_cursor_groups.insert(index, (IconFileKind::Cursor, bytes));
                 }
             }
             _ => {}
@@ -279,9 +262,11 @@ fn render_resource_script(
     }
 
     for (index, leaf) in leaves.iter().enumerate() {
-        if handled.contains(&index) {
+        if let Some((kind, bytes)) = icon_or_cursor_groups.remove(&index) {
+            renderer.render_icon_or_cursor(leaf, kind, bytes)?;
             continue;
         }
+
         match leaf.typ {
             ResourceKey::Id(pe::RT_ICON)
                 if numeric_name(&leaf.name)
@@ -295,7 +280,11 @@ fn render_resource_script(
             {
                 continue;
             }
-            ResourceKey::Id(pe::RT_STRING) if handled.contains(&index) => continue,
+            ResourceKey::Id(pe::RT_STRING) => {
+                if !renderer.try_render_string_table(leaf).unwrap_or(false) {
+                    renderer.render_raw_resource(leaf)?;
+                }
+            }
             ResourceKey::Id(pe::RT_MENU) => {
                 match render_menu_resource(leaf, &mut renderer.definitions) {
                     Ok(text) => renderer.render_text_resource(leaf.language, &text),
@@ -1444,6 +1433,7 @@ mod tests {
             typ: ResourceKey::Id(pe::RT_GROUP_ICON),
             name: ResourceKey::Id(1),
             language: 0x0409,
+            data_rva: 0,
             data: &[
                 0, 0, 1, 0, 1, 0, // group header
                 1, 1, 0, 0, 1, 0, 32, 0, 4, 0, 0, 0, 7, 0,
@@ -1465,6 +1455,7 @@ mod tests {
             typ: ResourceKey::Id(pe::RT_GROUP_CURSOR),
             name: ResourceKey::Id(2),
             language: 0x0409,
+            data_rva: 0,
             data: &[
                 0, 0, 2, 0, 1, 0, // group header
                 16, 0, 34, 0, 1, 0, 1, 0, 8, 0, 0, 0, 5, 0,

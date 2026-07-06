@@ -253,6 +253,8 @@ fn ti_resources_roundtrip_through_unres_and_msvc() {
     let rebuilt_exe = compile_empty_winmain_resource_app(&generated_rc);
 
     assert_resource_fingerprints_match(&input_exe, &rebuilt_exe);
+    assert_resource_order_fingerprints_match(&input_exe, &rebuilt_exe);
+    assert_resource_physical_order_matches(&input_exe, &rebuilt_exe);
 }
 
 #[test]
@@ -736,6 +738,7 @@ struct TestResourceLeaf {
     typ: TestResourceKey,
     name: TestResourceKey,
     language: u16,
+    data_rva: u32,
     data: Vec<u8>,
 }
 
@@ -761,9 +764,49 @@ enum ResourceFingerprint {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhysicalResourceFingerprint {
+    typ: TestResourceKey,
+    name: TestResourceKey,
+    language: u16,
+    data: Vec<u8>,
+}
+
 fn assert_resource_fingerprints_match(original: &Path, rebuilt: &Path) {
     let original_fingerprint = resource_fingerprint(original);
     let rebuilt_fingerprint = resource_fingerprint(rebuilt);
+    if original_fingerprint != rebuilt_fingerprint {
+        panic!(
+            "{}",
+            resource_fingerprint_mismatch(
+                original,
+                rebuilt,
+                &original_fingerprint,
+                &rebuilt_fingerprint
+            )
+        );
+    }
+}
+
+fn assert_resource_physical_order_matches(original: &Path, rebuilt: &Path) {
+    let original_fingerprint = resource_physical_order_fingerprint(original);
+    let rebuilt_fingerprint = resource_physical_order_fingerprint(rebuilt);
+    if original_fingerprint != rebuilt_fingerprint {
+        panic!(
+            "{}",
+            resource_physical_order_mismatch(
+                original,
+                rebuilt,
+                &original_fingerprint,
+                &rebuilt_fingerprint
+            )
+        );
+    }
+}
+
+fn assert_resource_order_fingerprints_match(original: &Path, rebuilt: &Path) {
+    let original_fingerprint = resource_order_fingerprint(original);
+    let rebuilt_fingerprint = resource_order_fingerprint(rebuilt);
     if original_fingerprint != rebuilt_fingerprint {
         panic!(
             "{}",
@@ -857,6 +900,51 @@ fn resource_fingerprint_summary(fingerprint: &ResourceFingerprint) -> String {
     }
 }
 
+fn resource_physical_order_mismatch(
+    original: &Path,
+    rebuilt: &Path,
+    original_fingerprint: &[PhysicalResourceFingerprint],
+    rebuilt_fingerprint: &[PhysicalResourceFingerprint],
+) -> String {
+    let first_difference = original_fingerprint
+        .iter()
+        .zip(rebuilt_fingerprint)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| original_fingerprint.len().min(rebuilt_fingerprint.len()));
+    format!(
+        "physical resource order mismatch after round-trip\n\
+         original: {} ({} entries)\n\
+         rebuilt: {} ({} entries)\n\
+         first difference: {}\n\
+         original entry: {}\n\
+         rebuilt entry: {}",
+        original.display(),
+        original_fingerprint.len(),
+        rebuilt.display(),
+        rebuilt_fingerprint.len(),
+        first_difference,
+        original_fingerprint
+            .get(first_difference)
+            .map(resource_physical_fingerprint_summary)
+            .unwrap_or_else(|| "<missing>".to_owned()),
+        rebuilt_fingerprint
+            .get(first_difference)
+            .map(resource_physical_fingerprint_summary)
+            .unwrap_or_else(|| "<missing>".to_owned())
+    )
+}
+
+fn resource_physical_fingerprint_summary(fingerprint: &PhysicalResourceFingerprint) -> String {
+    format!(
+        "leaf type={} name={} language={:04X} len={} hash={:08X}",
+        resource_key_summary(&fingerprint.typ),
+        resource_key_summary(&fingerprint.name),
+        fingerprint.language,
+        fingerprint.data.len(),
+        hash_bytes(&fingerprint.data)
+    )
+}
+
 fn resource_key_summary(key: &TestResourceKey) -> String {
     match key {
         TestResourceKey::Id(id) => format!("#{id}"),
@@ -871,6 +959,12 @@ fn hash_bytes(bytes: &[u8]) -> u32 {
 }
 
 fn resource_fingerprint(exe: &Path) -> Vec<ResourceFingerprint> {
+    let mut fingerprints = resource_order_fingerprint(exe);
+    fingerprints.sort();
+    fingerprints
+}
+
+fn resource_order_fingerprint(exe: &Path) -> Vec<ResourceFingerprint> {
     let leaves = read_resource_leaves(exe);
     let mut fingerprints = Vec::new();
     let mut grouped_images = BTreeSet::new();
@@ -883,45 +977,52 @@ fn resource_fingerprint(exe: &Path) -> Vec<ResourceFingerprint> {
             continue;
         };
 
-        let image_ids = group_resource_image_ids(leaf);
-        let image_payloads = image_ids
-            .iter()
-            .map(|image_id| {
-                grouped_images.insert((image_type, leaf.language, *image_id));
-                resource_leaf_data(&leaves, image_type, leaf.language, *image_id)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "{} group {:?} language {:04X} references missing image resource {}",
-                            exe.display(),
-                            leaf.name,
-                            leaf.language,
-                            image_id
-                        )
-                    })
-                    .to_vec()
-            })
-            .collect::<Vec<_>>();
-
-        fingerprints.push(ResourceFingerprint::IconOrCursorGroup {
-            typ: group_type,
-            name: leaf.name.clone(),
-            language: leaf.language,
-            group_without_image_ids: group_resource_without_image_ids(leaf),
-            image_payloads,
-        });
+        for image_id in group_resource_image_ids(leaf) {
+            grouped_images.insert((image_type, leaf.language, image_id));
+        }
     }
 
-    for leaf in leaves {
-        match leaf.typ {
+    let mut leaves_by_data = leaves.iter().collect::<Vec<_>>();
+    leaves_by_data.sort_by_key(|leaf| leaf.data_rva);
+    for leaf in leaves_by_data {
+        match leaf.typ.clone() {
+            TestResourceKey::Id(resource_type) if grouped_image_type(resource_type).is_some() => {
+                let image_type = grouped_image_type(resource_type).expect("group type was checked");
+                let image_ids = group_resource_image_ids(leaf);
+                let image_payloads = image_ids
+                    .iter()
+                    .map(|image_id| {
+                        resource_leaf_data(&leaves, image_type, leaf.language, *image_id)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{} group {:?} language {:04X} references missing image resource {}",
+                                    exe.display(),
+                                    leaf.name,
+                                    leaf.language,
+                                    image_id
+                                )
+                            })
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>();
+
+                fingerprints.push(ResourceFingerprint::IconOrCursorGroup {
+                    typ: resource_type,
+                    name: leaf.name.clone(),
+                    language: leaf.language,
+                    group_without_image_ids: group_resource_without_image_ids(leaf),
+                    image_payloads,
+                });
+            }
             TestResourceKey::Id(resource_type)
                 if resource_type == pe::RT_ICON || resource_type == pe::RT_CURSOR =>
             {
                 let Some(resource_id) = numeric_resource_key(&leaf.name) else {
                     fingerprints.push(ResourceFingerprint::Leaf {
                         typ: TestResourceKey::Id(resource_type),
-                        name: leaf.name,
+                        name: leaf.name.clone(),
                         language: leaf.language,
-                        data: leaf.data,
+                        data: leaf.data.clone(),
                     });
                     continue;
                 };
@@ -929,23 +1030,33 @@ fn resource_fingerprint(exe: &Path) -> Vec<ResourceFingerprint> {
                     fingerprints.push(ResourceFingerprint::UngroupedIconOrCursor {
                         typ: resource_type,
                         language: leaf.language,
-                        data: leaf.data,
+                        data: leaf.data.clone(),
                     });
                 }
             }
-            TestResourceKey::Id(resource_type)
-                if resource_type == pe::RT_GROUP_ICON || resource_type == pe::RT_GROUP_CURSOR => {}
             typ => fingerprints.push(ResourceFingerprint::Leaf {
-                typ,
-                name: leaf.name,
+                typ: typ.clone(),
+                name: leaf.name.clone(),
                 language: leaf.language,
-                data: leaf.data,
+                data: leaf.data.clone(),
             }),
         }
     }
-
-    fingerprints.sort();
     fingerprints
+}
+
+fn resource_physical_order_fingerprint(exe: &Path) -> Vec<PhysicalResourceFingerprint> {
+    let mut leaves = read_resource_leaves(exe);
+    leaves.sort_by_key(|leaf| leaf.data_rva);
+    leaves
+        .into_iter()
+        .map(|leaf| PhysicalResourceFingerprint {
+            typ: leaf.typ,
+            name: leaf.name,
+            language: leaf.language,
+            data: leaf.data,
+        })
+        .collect()
 }
 
 fn grouped_image_type(resource_type: u16) -> Option<u16> {
@@ -1099,6 +1210,7 @@ where
                     typ: typ.clone(),
                     name: name.clone(),
                     language,
+                    data_rva: rva,
                     data,
                 });
             }
