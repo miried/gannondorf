@@ -85,6 +85,93 @@ fn missing_args_prints_usage_hints() {
 }
 
 #[test]
+fn cxxmap_writes_derived_map_without_rewriting_unchanged_file() {
+    let dir = new_test_dir("cxxmap");
+    let source = dir.join("foo.cpp");
+    fs::write(
+        &source,
+        "//! FILE basic.exe\n\
+         \n\
+         //! FUNC 0x00401000\n\
+         extern \"C\" int foo();\n",
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", source.display()));
+    let output_dir = dir.join("maps");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cxxmap"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&output_dir)
+        .output()
+        .expect("failed to run cxxmap");
+    assert_success("run cxxmap output", &output);
+    assert!(
+        output.stdout.is_empty(),
+        "expected cxxmap -o to avoid stdout, got:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let map_path = output_dir.join("foo.map");
+    let map_text = fs::read_to_string(&map_path)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", map_path.display()));
+    assert_contains(&map_text, "binary = \"basic.exe\"");
+    assert_contains(&map_text, "\"foo\": 0x00401000,");
+
+    let mut permissions = fs::metadata(&map_path)
+        .unwrap_or_else(|err| panic!("failed to stat `{}`: {err}", map_path.display()))
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&map_path, permissions)
+        .unwrap_or_else(|err| panic!("failed to make `{}` read-only: {err}", map_path.display()));
+
+    let second_output = Command::new(env!("CARGO_BIN_EXE_cxxmap"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&output_dir)
+        .output()
+        .expect("failed to rerun cxxmap");
+
+    let mut permissions = fs::metadata(&map_path)
+        .unwrap_or_else(|err| panic!("failed to stat `{}`: {err}", map_path.display()))
+        .permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(&map_path, permissions)
+        .unwrap_or_else(|err| panic!("failed to make `{}` writable: {err}", map_path.display()));
+
+    assert_success("rerun cxxmap output", &second_output);
+    assert!(
+        second_output.stdout.is_empty(),
+        "expected cxxmap -o to avoid stdout, got:\n{}",
+        String::from_utf8_lossy(&second_output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(&map_path)
+            .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", map_path.display())),
+        map_text
+    );
+}
+
+#[test]
+fn cxxmap_prints_nothing_for_source_without_mappings() {
+    let dir = new_test_dir("cxxmap-empty");
+    let source = dir.join("empty.cpp");
+    fs::write(&source, "int helper() { return 0; }\n")
+        .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", source.display()));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cxxmap"))
+        .arg(&source)
+        .output()
+        .expect("failed to run cxxmap");
+
+    assert_success("run cxxmap without mappings", &output);
+    assert!(
+        output.stdout.is_empty(),
+        "expected cxxmap to avoid stdout for an unmapped source, got:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn cxxunlink_extracts_addresses_from_annotated_source() {
     let build = compile_fixture("basic.cpp");
     let source_symbols = [

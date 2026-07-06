@@ -48,6 +48,12 @@ void fn_0041bb40();
 cxxmap tests/mapping_test.cpp
 ```
 
+It can also write `mapping_test.map` into an output directory:
+
+```sh
+cxxmap tests/mapping_test.cpp -o build/maps
+```
+
 `cxxunlink` resolves the `FILE` annotation under a binary directory and writes a
 combined object for every mapped function address:
 
