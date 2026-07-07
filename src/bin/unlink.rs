@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gannondorf::{
-    Error, Result, default_output_path, extract_function_object, extract_function_objects,
-    extract_functions_object, parse_address,
+    Error, FunctionMapping, MappingEntry, Result, default_output_path, extract_function_object,
+    extract_function_objects, extract_functions_object, parse_address, parse_mapping_file,
 };
 
 #[derive(Debug, Parser)]
@@ -130,18 +130,6 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MapExtraction {
-    binary: Option<String>,
-    entries: Vec<MapEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MapEntry {
-    name: String,
-    address: u64,
-}
-
 fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result<()> {
     let text = fs::read_to_string(map)
         .map_err(|err| Error::new(format!("failed to read `{}`: {err}", map.display())))?;
@@ -150,7 +138,7 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
         .map(PathBuf::from)
         .unwrap_or_else(|| default_map_output_path(map));
 
-    if mapping.entries.is_empty() {
+    if mapping.map.is_empty() {
         println!(
             "skipped {} because it does not contain mapped functions",
             map.display()
@@ -161,13 +149,13 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
     let input_exe = resolve_map_input(input, &mapping)?;
     let input_bytes = fs::read(&input_exe)
         .map_err(|err| Error::new(format!("failed to read `{}`: {err}", input_exe.display())))?;
-    let addresses = unique_map_addresses(&mapping.entries);
+    let addresses = unique_map_addresses(&mapping.map);
     let extracted = extract_functions_object(&input_bytes, &addresses)?;
     fs::write(&output, &extracted.bytes)
         .map_err(|err| Error::new(format!("failed to write `{}`: {err}", output.display())))?;
 
     let names = mapping
-        .entries
+        .map
         .iter()
         .map(|entry| format!("{}=0x{:08X}", entry.name, entry.address))
         .collect::<Vec<_>>()
@@ -182,77 +170,7 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
     Ok(())
 }
 
-fn parse_mapping_file(text: &str) -> Result<MapExtraction> {
-    let mut binary = None;
-    let mut entries = Vec::new();
-    let mut in_map = false;
-
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if in_map {
-            if line == "}" {
-                in_map = false;
-                continue;
-            }
-            entries.push(parse_mapping_entry_line(line, line_number)?);
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("binary") {
-            binary = Some(parse_binary_line(value, line_number)?);
-        } else if line == "map = {" {
-            in_map = true;
-        } else {
-            return Err(Error::new(format!(
-                "unexpected mapping line {line_number}: `{line}`"
-            )));
-        }
-    }
-
-    if in_map {
-        return Err(Error::new("mapping file ended before closing `}`"));
-    }
-
-    Ok(MapExtraction {
-        binary: binary.flatten(),
-        entries,
-    })
-}
-
-fn parse_binary_line(value: &str, line_number: usize) -> Result<Option<String>> {
-    let value = value
-        .trim_start()
-        .strip_prefix('=')
-        .ok_or_else(|| Error::new(format!("invalid binary entry on line {line_number}")))?
-        .trim();
-    if value == "null" {
-        return Ok(None);
-    }
-    parse_quoted_string(value, line_number).map(Some)
-}
-
-fn parse_mapping_entry_line(line: &str, line_number: usize) -> Result<MapEntry> {
-    let line = line.strip_suffix(',').unwrap_or(line).trim_end();
-    let (name, address) = line
-        .split_once(':')
-        .ok_or_else(|| Error::new(format!("invalid map entry on line {line_number}")))?;
-    Ok(MapEntry {
-        name: parse_quoted_string(name.trim(), line_number)?,
-        address: parse_address(address.trim())?,
-    })
-}
-
-fn parse_quoted_string(value: &str, line_number: usize) -> Result<String> {
-    serde_json::from_str(value)
-        .map_err(|err| Error::new(format!("invalid string on line {line_number}: {err}")))
-}
-
-fn resolve_map_input(input: &Path, mapping: &MapExtraction) -> Result<PathBuf> {
+fn resolve_map_input(input: &Path, mapping: &FunctionMapping) -> Result<PathBuf> {
     if !input.is_dir() {
         return Ok(input.to_path_buf());
     }
@@ -265,7 +183,7 @@ fn resolve_map_input(input: &Path, mapping: &MapExtraction) -> Result<PathBuf> {
     Ok(input.join(binary))
 }
 
-fn unique_map_addresses(entries: &[MapEntry]) -> Vec<u64> {
+fn unique_map_addresses(entries: &[MappingEntry]) -> Vec<u64> {
     let mut addresses = entries
         .iter()
         .map(|entry| entry.address)

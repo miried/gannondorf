@@ -8,6 +8,8 @@ several sibling command-line tools:
 - `cxxmap` extracts binary/function address mappings from annotated C++ source.
 - `cxxunlink` parses those source annotations and extracts the mapped functions
   from the annotated binary.
+- `objdiff-json` creates or incrementally updates objdiff config units from
+  cxxmap `.map` files.
 - `unres` extracts PE resources into an MSVC-compatible resource script,
   generated header, and sidecar asset files.
 
@@ -74,6 +76,17 @@ cxxunlink src/sub_004321D0.cpp bin \
 The generated unit includes `target_path`, `base_path` when supplied,
 `metadata.source_path`, and `symbol_mappings` from extracted `sub_XXXXXXXX`
 symbols to the corresponding source-object symbols.
+
+## `objdiff-json`
+
+To create or update objdiff units for changed map files:
+
+```sh
+objdiff-json --json objdiff.json --target-dir target --build-dir build --source-dir src maps/main.map
+```
+
+Only units for the map files passed on the command line are changed. Non-empty
+maps add or update their unit; empty maps remove their unit.
 
 ## `unres`
 

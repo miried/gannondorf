@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gannondorf::discover_functions;
 use iced_x86::{Decoder, DecoderOptions};
-use object::SymbolKind;
 use object::endian::LittleEndian as LE;
 use object::pe;
 use object::read::FileKind;
@@ -18,6 +17,9 @@ use object::read::pe::{
     ResourceDirectoryTable, ResourceNameOrId,
 };
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
+use object::{
+    Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+};
 use serde_json::{Value, json};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -56,7 +58,7 @@ fn help_describes_discovery_and_single_function_modes() {
     );
     assert_contains(
         &stdout,
-        "Without --address, -o/--output is an output directory",
+        "Without --address or --map, -o/--output is an output directory",
     );
     assert_contains(
         &stdout,
@@ -168,6 +170,104 @@ fn cxxmap_prints_nothing_for_source_without_mappings() {
         output.stdout.is_empty(),
         "expected cxxmap to avoid stdout for an unmapped source, got:\n{}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn objdiff_json_updates_only_passed_map_units() {
+    let dir = new_test_dir("objdiff-json");
+    fs::create_dir_all(dir.join("maps"))
+        .unwrap_or_else(|err| panic!("failed to create maps dir: {err}"));
+    fs::create_dir_all(dir.join("build"))
+        .unwrap_or_else(|err| panic!("failed to create build dir: {err}"));
+    write_test_coff(&dir.join("build/main.obj"), &["_foo@4", "?Bar@@YAXXZ"]);
+
+    fs::write(
+        dir.join("objdiff.json"),
+        serde_json::to_string_pretty(&json!({
+            "build_base": true,
+            "units": [
+                {
+                    "name": "main",
+                    "target_path": "old/main.obj",
+                    "metadata": {
+                        "complete": true,
+                        "source_path": "old/main.cpp"
+                    },
+                    "symbol_mappings": {
+                        "old": "old"
+                    }
+                },
+                {
+                    "name": "stubs",
+                    "target_path": "target/stubs.obj",
+                    "base_path": "build/stubs.obj"
+                },
+                {
+                    "name": "other",
+                    "target_path": "target/other.obj",
+                    "metadata": {
+                        "complete": true,
+                        "source_path": "src/other.cpp"
+                    },
+                    "custom": "preserved"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap_or_else(|err| panic!("failed to write objdiff JSON: {err}"));
+    fs::write(
+        dir.join("maps/main.map"),
+        "binary = \"basic.exe\"\nmap = {\n  \"foo\": 0x00401000,\n  \"Bar\": 0x00401010,\n}\n",
+    )
+    .unwrap_or_else(|err| panic!("failed to write main map: {err}"));
+    fs::write(dir.join("maps/stubs.map"), "")
+        .unwrap_or_else(|err| panic!("failed to write stubs map: {err}"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_objdiff-json"))
+        .current_dir(&dir)
+        .arg("--json")
+        .arg("objdiff.json")
+        .arg("--target-dir")
+        .arg("target")
+        .arg("--build-dir")
+        .arg("build")
+        .arg("--source-dir")
+        .arg("src")
+        .arg("maps/main.map")
+        .arg("maps/stubs.map")
+        .output()
+        .expect("failed to run objdiff-json");
+    assert_success("run objdiff-json", &output);
+
+    let generated_json = fs::read_to_string(dir.join("objdiff.json"))
+        .unwrap_or_else(|err| panic!("failed to read objdiff JSON: {err}"));
+    let config: Value = serde_json::from_str(&generated_json)
+        .unwrap_or_else(|err| panic!("failed to parse generated objdiff JSON: {err}"));
+    assert_eq!(config["build_base"], true);
+    assert_eq!(config["units"].as_array().unwrap().len(), 2);
+
+    let main = unit_by_name(&config, "main");
+    assert_eq!(main["target_path"], "target/main.obj");
+    assert_eq!(main["base_path"], "build/main.obj");
+    assert_eq!(main["metadata"]["complete"], true);
+    assert_eq!(main["metadata"]["source_path"], "src/main.cpp");
+    assert_eq!(main["symbol_mappings"]["sub_00401000"], "_foo@4");
+    assert_eq!(main["symbol_mappings"]["sub_00401010"], "?Bar@@YAXXZ");
+
+    assert!(unit_by_name_opt(&config, "stubs").is_none());
+    assert_eq!(
+        unit_by_name(&config, "other"),
+        &json!({
+            "name": "other",
+            "target_path": "target/other.obj",
+            "metadata": {
+                "complete": true,
+                "source_path": "src/other.cpp"
+            },
+            "custom": "preserved"
+        })
     );
 }
 
@@ -1993,6 +2093,45 @@ fn format_address_list(addresses: &[u64]) -> String {
 
 fn format_code_symbol(va: u64) -> String {
     format!("sub_{va:08X}")
+}
+
+fn unit_by_name<'a>(config: &'a Value, name: &str) -> &'a Value {
+    unit_by_name_opt(config, name).unwrap_or_else(|| panic!("missing objdiff unit `{name}`"))
+}
+
+fn unit_by_name_opt<'a>(config: &'a Value, name: &str) -> Option<&'a Value> {
+    config["units"].as_array()?.iter().find(|unit| {
+        unit.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|unit_name| unit_name == name)
+    })
+}
+
+fn write_test_coff(path: &Path, symbols: &[&str]) {
+    let mut object =
+        object::write::Object::new(BinaryFormat::Coff, Architecture::I386, Endianness::Little);
+    object.set_mangling(object::write::Mangling::None);
+    let text = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+
+    for symbol in symbols {
+        let offset = object.append_section_data(text, &[0xC3], 1);
+        object.add_symbol(object::write::Symbol {
+            name: symbol.as_bytes().to_vec(),
+            value: offset,
+            size: 1,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+    }
+
+    let data = object
+        .write()
+        .unwrap_or_else(|err| panic!("failed to render test COFF: {err}"));
+    fs::write(path, data)
+        .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
 fn new_test_dir(fixture: &str) -> PathBuf {

@@ -19,6 +19,10 @@ path = "src/bin/cxxmap.rs"
 name = "cxxunlink"
 path = "src/bin/cxxunlink.rs"
 
+[[bin]]
+name = "objdiff-json"
+path = "src/bin/objdiff_json.rs"
+
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 iced-x86 = "1.21.0"

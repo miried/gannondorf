@@ -11,6 +11,7 @@ pub use functions::{
 };
 pub use mapping::{
     FunctionMapping, MappingEntry, extract_function_mapping, parse_function_mapping_ast,
+    parse_mapping_file,
 };
 pub use resources::{ExtractedResources, ResourceAsset, extract_resource_script};
 

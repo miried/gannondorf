@@ -44,6 +44,76 @@ pub fn parse_function_mapping_ast(ast_json: &str) -> Result<Vec<MappingEntry>> {
     Ok(sorted_mapping_entries(entries))
 }
 
+pub fn parse_mapping_file(text: &str) -> Result<FunctionMapping> {
+    let mut binary = None;
+    let mut entries = Vec::new();
+    let mut in_map = false;
+
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if in_map {
+            if line == "}" {
+                in_map = false;
+                continue;
+            }
+            entries.push(parse_mapping_entry_line(line, line_number)?);
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("binary") {
+            binary = Some(parse_binary_line(value, line_number)?);
+        } else if line == "map = {" {
+            in_map = true;
+        } else {
+            return Err(Error::new(format!(
+                "unexpected mapping line {line_number}: `{line}`"
+            )));
+        }
+    }
+
+    if in_map {
+        return Err(Error::new("mapping file ended before closing `}`"));
+    }
+
+    Ok(FunctionMapping {
+        binary: binary.flatten(),
+        map: entries,
+    })
+}
+
+fn parse_binary_line(value: &str, line_number: usize) -> Result<Option<String>> {
+    let value = value
+        .trim_start()
+        .strip_prefix('=')
+        .ok_or_else(|| Error::new(format!("invalid binary entry on line {line_number}")))?
+        .trim();
+    if value == "null" {
+        return Ok(None);
+    }
+    parse_quoted_string(value, line_number).map(Some)
+}
+
+fn parse_mapping_entry_line(line: &str, line_number: usize) -> Result<MappingEntry> {
+    let line = line.strip_suffix(',').unwrap_or(line).trim_end();
+    let (name, address) = line
+        .split_once(':')
+        .ok_or_else(|| Error::new(format!("invalid map entry on line {line_number}")))?;
+    Ok(MappingEntry {
+        name: parse_quoted_string(name.trim(), line_number)?,
+        address: parse_address(address.trim())?,
+    })
+}
+
+fn parse_quoted_string(value: &str, line_number: usize) -> Result<String> {
+    serde_json::from_str(value)
+        .map_err(|err| Error::new(format!("invalid string on line {line_number}: {err}")))
+}
+
 fn parse_function_mapping_source(source: &str) -> Result<Vec<MappingEntry>> {
     let annotations = parse_func_annotations(source)?;
     let functions = parse_cpp_functions(source)?;
