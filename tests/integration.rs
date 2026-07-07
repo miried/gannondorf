@@ -408,6 +408,57 @@ fn multi_function_extraction_writes_one_object_with_all_symbols() {
 }
 
 #[test]
+fn map_file_extraction_writes_one_object_with_all_symbols() {
+    let build = compile_fixture("basic.cpp");
+    let symbols = [
+        "_fixture_no_refs",
+        "_fixture_calls_function",
+        "_fixture_uses_global",
+    ];
+    let addresses = symbols
+        .iter()
+        .map(|symbol| linked_va_for_source_symbol(&build, symbol))
+        .collect::<Vec<_>>();
+    let map = build.dir.join("basic.map");
+    fs::write(
+        &map,
+        format!(
+            "binary = \"basic.exe\"\n\
+             map = {{\n\
+               \"fixture_no_refs\": 0x{:08X},\n\
+               \"fixture_calls_function\": 0x{:08X},\n\
+               \"fixture_uses_global\": 0x{:08X},\n\
+             }}\n",
+            addresses[0], addresses[1], addresses[2]
+        ),
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", map.display()));
+    let output = build.dir.join("mapped.obj");
+
+    run_unlink_map(&build.dir, &map, &output);
+
+    for (address, symbol) in addresses.iter().zip(symbols) {
+        assert_objdiff_symbol_matches(&output, &build.obj, &format_code_symbol(*address), symbol);
+    }
+}
+
+#[test]
+fn empty_map_file_skips_output_object() {
+    let dir = new_test_dir("empty-map");
+    let map = dir.join("empty.map");
+    let output_obj = dir.join("empty.obj");
+    fs::write(&map, "").unwrap_or_else(|err| panic!("failed to write `{}`: {err}", map.display()));
+
+    run_unlink_empty_map(&dir, &map, &output_obj);
+
+    assert!(
+        !output_obj.exists(),
+        "`{}` should not be created for an empty map",
+        output_obj.display()
+    );
+}
+
+#[test]
 #[ignore = "tracking scanner/Ghidra function-set delta while discovery is being hardened"]
 fn ti_function_discovery_known_delta_matches_ghidra_export() {
     let comparison = ti_function_comparison();
@@ -706,6 +757,34 @@ fn run_unlink_addresses(exe: &Path, addresses: &[u64], output_obj: &Path) {
         .output()
         .expect("failed to run unlink multi-address extraction");
     assert_success("run unlink multi-address extraction", &output);
+}
+
+fn run_unlink_map(input: &Path, map: &Path, output_obj: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_unlink"))
+        .arg(input)
+        .arg("--map")
+        .arg(map)
+        .arg("-o")
+        .arg(output_obj)
+        .output()
+        .expect("failed to run unlink map extraction");
+    assert_success("run unlink map extraction", &output);
+}
+
+fn run_unlink_empty_map(input: &Path, map: &Path, output_obj: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_unlink"))
+        .arg(input)
+        .arg("--map")
+        .arg(map)
+        .arg("-o")
+        .arg(output_obj)
+        .output()
+        .expect("failed to run unlink empty map extraction");
+    assert_success("run unlink empty map extraction", &output);
+    assert_contains(
+        &String::from_utf8_lossy(&output.stdout),
+        "does not contain mapped functions",
+    );
 }
 
 fn run_cxxunlink(source: &Path, binary_dir: &Path, output_obj: &Path) {
