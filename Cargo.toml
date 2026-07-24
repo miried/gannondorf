@@ -16,10 +16,6 @@ name = "cxxmap"
 path = "src/bin/cxxmap.rs"
 
 [[bin]]
-name = "cxxunlink"
-path = "src/bin/cxxunlink.rs"
-
-[[bin]]
 name = "objdiff-json"
 path = "src/bin/objdiff_json.rs"
 

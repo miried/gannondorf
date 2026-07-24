@@ -6,8 +6,6 @@ several sibling command-line tools:
 - `unlink` extracts discovered functions into isolated COFF object files,
   creating relocations where necessary.
 - `cxxmap` extracts binary/function address mappings from annotated C++ source.
-- `cxxunlink` parses those source annotations and extracts the mapped functions
-  from the annotated binary.
 - `objdiff-json` creates or incrementally updates objdiff config units from
   cxxmap `.map` files.
 - `unres` extracts PE resources into an MSVC-compatible resource script,
@@ -33,7 +31,7 @@ When `--address` is omitted, `unlink` discovers PE32/i386 functions automaticall
 unlink input.exe -o extracted-objects
 ```
 
-## `cxxmap` and `cxxunlink`
+## `cxxmap`
 
 Annotated source files can name the target executable and function addresses:
 
@@ -56,26 +54,12 @@ It can also write `mapping_test.map` into an output directory:
 cxxmap tests/mapping_test.cpp -o build/maps
 ```
 
-`cxxunlink` resolves the `FILE` annotation under a binary directory and writes a
-combined object for every mapped function address:
+Pass the generated map to `unlink` to resolve its `binary` entry under a binary
+directory and extract all mapped functions into one object:
 
 ```sh
-cxxunlink tests/mapping_test.cpp tests/bin -o mapped.obj
+unlink tests/bin --map build/maps/mapping_test.map -o target/mapping_test.obj
 ```
-
-It can also create or update an objdiff `units` entry for the extracted object:
-
-```sh
-cxxunlink src/sub_004321D0.cpp bin \
-  -o target/sub_004321D0.obj \
-  --objdiff-json objdiff.json \
-  --objdiff-unit-name WinMain \
-  --objdiff-base-path build/sub_004321D0.obj
-```
-
-The generated unit includes `target_path`, `base_path` when supplied,
-`metadata.source_path`, and `symbol_mappings` from extracted `sub_XXXXXXXX`
-symbols to the corresponding source-object symbols.
 
 ## `objdiff-json`
 
@@ -86,7 +70,8 @@ objdiff-json --json objdiff.json --target-dir target --build-dir build --source-
 ```
 
 Only units for the map files passed on the command line are changed. Non-empty
-maps add or update their unit; empty maps remove their unit.
+maps add or update their unit with target, base, source, and symbol mapping
+information; empty maps remove their unit.
 
 ## `unres`
 
