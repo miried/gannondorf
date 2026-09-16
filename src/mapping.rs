@@ -9,6 +9,14 @@ use crate::{Error, Result, parse_address};
 pub struct FunctionMapping {
     pub binary: Option<String>,
     pub map: Vec<MappingEntry>,
+    pub data: Vec<DataMappingEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataMappingEntry {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +41,8 @@ struct CppFunction {
 pub fn extract_function_mapping(source: &str) -> Result<FunctionMapping> {
     let binary = parse_binary_name(source);
     let map = parse_function_mapping_source(source)?;
-    Ok(FunctionMapping { binary, map })
+    let data = parse_data_mapping_source(source)?;
+    Ok(FunctionMapping { binary, map, data })
 }
 
 pub fn parse_function_mapping_ast(ast_json: &str) -> Result<Vec<MappingEntry>> {
@@ -47,7 +56,9 @@ pub fn parse_function_mapping_ast(ast_json: &str) -> Result<Vec<MappingEntry>> {
 pub fn parse_mapping_file(text: &str) -> Result<FunctionMapping> {
     let mut binary = None;
     let mut entries = Vec::new();
+    let mut data = Vec::new();
     let mut in_map = false;
+    let mut in_data = false;
 
     for (index, raw_line) in text.lines().enumerate() {
         let line_number = index + 1;
@@ -56,12 +67,45 @@ pub fn parse_mapping_file(text: &str) -> Result<FunctionMapping> {
             continue;
         }
 
-        if in_map {
+        if in_map || in_data {
             if line == "}" {
                 in_map = false;
+                in_data = false;
                 continue;
             }
-            entries.push(parse_mapping_entry_line(line, line_number)?);
+            if in_data {
+                let entry: Value =
+                    serde_json::from_str(&format!("{{{}}}", line.trim_end_matches(','))).map_err(
+                        |err| {
+                            Error::new(format!("invalid data entry on line {line_number}: {err}"))
+                        },
+                    )?;
+                let (name, fields) =
+                    entry.as_object().unwrap().iter().next().ok_or_else(|| {
+                        Error::new(format!("empty data entry on line {line_number}"))
+                    })?;
+                if entry.as_object().unwrap().len() != 1
+                    || fields.as_object().is_none_or(|o| o.len() != 2)
+                {
+                    return Err(Error::new(format!(
+                        "expected one data name with address and size on line {line_number}"
+                    )));
+                }
+                let number = |key: &str| -> Result<u64> {
+                    fields.get(key).and_then(Value::as_u64).ok_or_else(|| {
+                        Error::new(format!(
+                            "data {key} must be an unsigned integer on line {line_number}"
+                        ))
+                    })
+                };
+                data.push(DataMappingEntry {
+                    name: name.clone(),
+                    address: number("address")?,
+                    size: number("size")?,
+                });
+            } else {
+                entries.push(parse_mapping_entry_line(line, line_number)?);
+            }
             continue;
         }
 
@@ -69,6 +113,8 @@ pub fn parse_mapping_file(text: &str) -> Result<FunctionMapping> {
             binary = Some(parse_binary_line(value, line_number)?);
         } else if line == "map = {" {
             in_map = true;
+        } else if line == "data = {" {
+            in_data = true;
         } else {
             return Err(Error::new(format!(
                 "unexpected mapping line {line_number}: `{line}`"
@@ -76,14 +122,142 @@ pub fn parse_mapping_file(text: &str) -> Result<FunctionMapping> {
         }
     }
 
-    if in_map {
+    if in_map || in_data {
         return Err(Error::new("mapping file ended before closing `}`"));
     }
 
+    validate_data_entries(&mut data)?;
     Ok(FunctionMapping {
         binary: binary.flatten(),
         map: entries,
+        data,
     })
+}
+
+fn validate_data_entries(entries: &mut Vec<DataMappingEntry>) -> Result<()> {
+    let mut names = BTreeMap::new();
+    for entry in entries.iter() {
+        if entry.name.is_empty()
+            || entry.size == 0
+            || entry.address.checked_add(entry.size).is_none()
+        {
+            return Err(Error::new(format!(
+                "invalid data range for `{}`: size must be positive and address + size must not overflow",
+                entry.name
+            )));
+        }
+        if let Some(previous) = names.insert(&entry.name, (entry.address, entry.size))
+            && previous != (entry.address, entry.size)
+        {
+            return Err(Error::new(format!(
+                "conflicting data entries for `{}`",
+                entry.name
+            )));
+        }
+    }
+    entries.sort_by(|a, b| (a.address, &a.name).cmp(&(b.address, &b.name)));
+    entries.dedup();
+    Ok(())
+}
+
+fn parse_data_mapping_source(source: &str) -> Result<Vec<DataMappingEntry>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .map_err(|err| Error::new(format!("failed to load C++ parser: {err}")))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| Error::new("failed to parse C++ source"))?;
+    let mut entries = Vec::new();
+    let mut end_byte = 0;
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        end_byte += line.len();
+        let Some(text) = doc_comment_text(line).and_then(|s| s.strip_prefix("DATA ")) else {
+            continue;
+        };
+        let fields: Vec<_> = text.split_whitespace().collect();
+        if fields.len() != 2 {
+            return Err(Error::new(format!(
+                "DATA annotation on line {} requires an address and explicit byte size",
+                index + 1
+            )));
+        }
+        let declaration = next_data_declaration(tree.root_node(), end_byte).ok_or_else(|| {
+            Error::new(format!(
+                "DATA annotation on line {} is not followed by a variable declaration",
+                index + 1
+            ))
+        })?;
+        let mut parent = declaration.parent();
+        while let Some(scope) = parent {
+            if matches!(
+                scope.kind(),
+                "compound_statement" | "field_declaration_list"
+            ) {
+                return Err(Error::new(format!(
+                    "DATA annotation on line {} requires a global variable",
+                    index + 1
+                )));
+            }
+            parent = scope.parent();
+        }
+        let mut cursor = declaration.walk();
+        let declarators: Vec<_> = declaration
+            .children_by_field_name("declarator", &mut cursor)
+            .collect();
+        if declaration.kind() != "declaration" || declaration.has_error() || declarators.len() != 1
+        {
+            return Err(Error::new(format!(
+                "DATA annotation on line {} requires exactly one variable declarator",
+                index + 1
+            )));
+        }
+        let declarator = declarators[0];
+        if contains_kind(declarator, "function_declarator") {
+            return Err(Error::new(format!(
+                "DATA annotation on line {} cannot annotate a function or function pointer",
+                index + 1
+            )));
+        }
+        let name = name_from_declarator(declarator, source)?.ok_or_else(|| {
+            Error::new(format!(
+                "DATA annotation on line {} has no variable name",
+                index + 1
+            ))
+        })?;
+        entries.push(DataMappingEntry {
+            name,
+            address: parse_address(fields[0])?,
+            size: parse_address(fields[1])?,
+        });
+    }
+    validate_data_entries(&mut entries)?;
+    Ok(entries)
+}
+
+// Stop at the next declaration, including unsupported declarations, so an
+// annotation cannot silently drift past a function or typedef to another global.
+fn next_data_declaration(node: Node<'_>, after: usize) -> Option<Node<'_>> {
+    if node.end_byte() <= after {
+        return None;
+    }
+    if node.start_byte() >= after
+        && matches!(
+            node.kind(),
+            "declaration" | "function_definition" | "type_definition" | "field_declaration"
+        )
+    {
+        return Some(node);
+    }
+    for index in 0..node.named_child_count() {
+        if let Some(found) = node
+            .named_child(index as u32)
+            .and_then(|child| next_data_declaration(child, after))
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn parse_binary_line(value: &str, line_number: usize) -> Result<Option<String>> {
@@ -415,6 +589,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn data_annotations_have_explicit_sizes_and_are_separate() {
+        let mapping = extract_function_mapping(
+            r#"
+//! FILE globals.exe
+extern "C" {
+//! DATA 0x402000 4
+volatile int initialized = 0x12345678;
+//! DATA 0x402018 4
+volatile int uninitialized;
+//! DATA 0x402008 0x10
+volatile int values[4] = {11, 22, 33, 44};
+}
+//! FUNC 0x401000
+int entry() { return values[2]; }
+"#,
+        )
+        .unwrap();
+        assert_eq!(mapping.map.len(), 1);
+        assert_eq!(
+            mapping.data,
+            vec![
+                DataMappingEntry {
+                    name: "initialized".into(),
+                    address: 0x402000,
+                    size: 4
+                },
+                DataMappingEntry {
+                    name: "values".into(),
+                    address: 0x402008,
+                    size: 16
+                },
+                DataMappingEntry {
+                    name: "uninitialized".into(),
+                    address: 0x402018,
+                    size: 4
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_data_annotations() {
+        for source in [
+            "//! DATA 0x402000\nint x;",
+            "//! DATA 0x402000 0\nint x;",
+            "//! DATA 0xffffffffffffffff 4\nint x;",
+            "//! DATA 0x402000 4\nint x, y;",
+            "//! DATA 0x402000 4\nint f();\nint x;",
+            "void f() {\n//! DATA 0x402000 4\nint x;\n}",
+            "//! DATA 0x402000 4\ntypedef int X;\nint x;",
+            "//! DATA 0x402000 4\n",
+            "//! DATA 0x402000 4\nint x;\n//! DATA 0x402004 4\nint x;",
+        ] {
+            assert!(
+                extract_function_mapping(source).is_err(),
+                "accepted {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_data_only_and_legacy_maps_and_rejects_invalid_sizes() {
+        let mapping = parse_mapping_file(
+            "binary = null\ndata = {\n\"x\": {\"address\": 4202496, \"size\": 4},\n}\n",
+        )
+        .unwrap();
+        assert!(mapping.map.is_empty());
+        assert_eq!(mapping.data[0].size, 4);
+        assert!(
+            parse_mapping_file("map = {\n\"f\": 0x401000,\n}\n")
+                .unwrap()
+                .data
+                .is_empty()
+        );
+        for fields in [
+            "\"address\": 1",
+            "\"address\": 1, \"size\": 0",
+            "\"address\": 1, \"size\": -4",
+            "\"address\": 1, \"size\": 1.5",
+            "\"address\": 18446744073709551615, \"size\": 4",
+        ] {
+            assert!(parse_mapping_file(&format!("data = {{\n\"x\": {{{fields}}},\n}}\n")).is_err());
+        }
+        assert!(parse_mapping_file("data = {\n").is_err());
+    }
+
+    #[test]
     fn extracts_binary_from_source_doc_comment() {
         let source = "//! FILE TI.EXE\n\n//! FUNC 0x0041bb40\nvoid f() {}\n";
         assert_eq!(parse_binary_name(source).as_deref(), Some("TI.EXE"));
@@ -428,6 +689,7 @@ mod tests {
             extract_function_mapping(source).unwrap(),
             FunctionMapping {
                 binary: Some("TI.EXE".to_owned()),
+                data: vec![],
                 map: vec![
                     MappingEntry {
                         name: "fn_0041bb40".to_owned(),

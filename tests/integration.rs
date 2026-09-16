@@ -26,6 +26,61 @@ static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();
 
 const KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES: &[u64] = &[];
+
+#[test]
+fn cxxmap_preserves_sized_globals_and_consumers_reject_unsupported_data() {
+    let dir = new_test_dir("data-mapping");
+    let source = dir.join("globals.cpp");
+    fs::write(&source, include_str!("fixtures/globals_mapping.cpp")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cxxmap"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_success("map globals fixture", &output);
+    let map = dir.join("globals.map");
+    let mapping = gannondorf::parse_mapping_file(&fs::read_to_string(&map).unwrap()).unwrap();
+    assert_eq!(mapping.map.len(), 1);
+    assert_eq!(
+        mapping
+            .data
+            .iter()
+            .map(|e| (e.name.as_str(), e.size))
+            .collect::<Vec<_>>(),
+        vec![("initialized", 4), ("values", 16), ("uninitialized", 4)]
+    );
+    let target = dir.join("globals.obj");
+    let config = dir.join("objdiff.json");
+    fs::write(&target, b"existing target").unwrap();
+    fs::write(&config, b"{\"units\": []}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_unlink"))
+        .arg(&dir)
+        .arg("--map")
+        .arg(&map)
+        .arg("-o")
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_contains(
+        &combined_output(&output),
+        "data extraction is not implemented yet",
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"existing target");
+    let output = Command::new(env!("CARGO_BIN_EXE_objdiff-json"))
+        .arg("--json")
+        .arg(&config)
+        .arg(&map)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_contains(
+        &combined_output(&output),
+        "data symbol resolution is not implemented yet",
+    );
+    assert_eq!(fs::read(&config).unwrap(), b"{\"units\": []}\n");
+}
 const EXPECTED_TI_COMMON_FUNCTIONS: usize = 1471;
 const EXPECTED_TI_SCANNER_ONLY_FUNCTIONS: &[u64] = &[
     0x0044FF1E, 0x0044FF61, 0x00451EA8, 0x00453F69, 0x00453F80, 0x004541D0, 0x00454250, 0x00454806,

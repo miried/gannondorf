@@ -134,6 +134,11 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
     let text = fs::read_to_string(map)
         .map_err(|err| Error::new(format!("failed to read `{}`: {err}", map.display())))?;
     let mapping = parse_mapping_file(&text)?;
+    if !mapping.data.is_empty() {
+        return Err(Error::new(
+            "data mappings are parsed but data extraction is not implemented yet",
+        ));
+    }
     let output = output
         .map(PathBuf::from)
         .unwrap_or_else(|| default_map_output_path(map));

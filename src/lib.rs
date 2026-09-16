@@ -10,8 +10,8 @@ pub use functions::{
     extract_function_object, extract_function_objects, extract_functions_object, parse_address,
 };
 pub use mapping::{
-    FunctionMapping, MappingEntry, extract_function_mapping, parse_function_mapping_ast,
-    parse_mapping_file,
+    DataMappingEntry, FunctionMapping, MappingEntry, extract_function_mapping,
+    parse_function_mapping_ast, parse_mapping_file,
 };
 pub use resources::{ExtractedResources, ResourceAsset, extract_resource_script};
 

@@ -8,8 +8,8 @@ use gannondorf::{Error, FunctionMapping, Result, extract_function_mapping};
 #[command(
     author,
     version,
-    about = "Extract binary/function address mappings from annotated C++ source.",
-    long_about = "Extract mappings from //! FILE and //! FUNC annotations in C++ source. The tool parses C++ syntax, attaches each FUNC annotation to the next function declaration or definition, and prints a simple mapping to stdout or to a .map file.",
+    about = "Extract function and sized data mappings from annotated C++ source.",
+    long_about = "Extract mappings from //! FILE, //! FUNC <address>, and //! DATA <address> <byte-size> annotations in C++ source. Data entries are separate from functions and require explicit positive sizes. Prints a mapping to stdout or to a .map file.",
     arg_required_else_help = true,
     after_help = "Examples:\n  cxxmap tests/mapping_test.cpp\n  cxxmap tests/mapping_test.cpp -o build/maps\n\nAnnotations:\n  //! FILE TI.EXE\n  //! FUNC 0x0041bb40\n  void fn_0041bb40();"
 )]
@@ -48,7 +48,7 @@ fn run() -> Result<()> {
 }
 
 fn render_mapping(mapping: &FunctionMapping) -> String {
-    if mapping.map.is_empty() {
+    if mapping.map.is_empty() && mapping.data.is_empty() {
         return String::new();
     }
 
@@ -68,6 +68,18 @@ fn render_mapping(mapping: &FunctionMapping) -> String {
         output.push('\n');
     }
     output.push_str("}\n");
+    if !mapping.data.is_empty() {
+        output.push_str("data = {\n");
+        for entry in &mapping.data {
+            output.push_str(&format!(
+                "  {}: {{\"address\": {}, \"size\": {}}},\n",
+                serde_json::to_string(&entry.name).unwrap(),
+                entry.address,
+                entry.size
+            ));
+        }
+        output.push_str("}\n");
+    }
     output
 }
 
@@ -102,4 +114,22 @@ fn default_output_file_name(input: &Path) -> PathBuf {
 
 fn escape_string(value: &str) -> String {
     value.escape_default().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_and_data_only_maps_round_trip() {
+        for source in [
+            "//! DATA 0x402000 4\nint value = 7;\n",
+            "//! FILE fixture.exe\n//! DATA 0x402000 16\nint values[4];\n//! FUNC 0x401000\nint entry();\n",
+        ] {
+            let mapping = extract_function_mapping(source).unwrap();
+            let rendered = render_mapping(&mapping);
+            assert!(rendered.contains("data = {"));
+            assert_eq!(gannondorf::parse_mapping_file(&rendered).unwrap(), mapping);
+        }
+    }
 }

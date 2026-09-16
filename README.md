@@ -61,6 +61,46 @@ directory and extract all mapped functions into one object:
 unlink tests/bin --map build/maps/mapping_test.map -o target/mapping_test.obj
 ```
 
+### Sized data mappings (parser support)
+
+`cxxmap` also accepts `//! DATA <address> <byte-size>` immediately before a
+single variable declaration, including initialized globals and arrays:
+
+```cpp
+//! DATA 0x00402008 16
+volatile int values[4] = { 11, 22, 33, 44 };
+```
+
+Addresses and sizes accept decimal or `0x` hexadecimal integers. Sizes are
+explicit byte counts, must be positive, and must not overflow when added to
+the address. The parser does not infer sizes from C++ types or initializers.
+Address-only DATA annotations now produce an error; determine the real layout
+before adding sizes to existing annotations.
+
+The existing function `map` block is unchanged. Data is emitted separately,
+using decimal JSON integers inside each entry:
+
+```text
+binary = "globals.exe"
+map = {
+  "entry": 0x00401000,
+}
+data = {
+  "values": {"address": 4202504, "size": 16},
+}
+```
+
+Data-only mappings are supported. Identical repeated data declarations are
+deduplicated; conflicting addresses or sizes for the same name are errors.
+Multiple declarators, typedefs, functions and function pointers are rejected.
+Range-overlap detection remains part of the planned extraction work.
+
+This implements mapping support only: `unlink` and `objdiff-json` currently
+reject maps containing data with an explicit unsupported-operation error,
+preserving existing outputs. They continue to accept legacy function-only maps.
+The public `FunctionMapping` type retains its name and function `map` field and
+adds a separate `Vec<DataMappingEntry>` named `data`.
+
 ## `objdiff-json`
 
 To create or update objdiff units for changed map files:

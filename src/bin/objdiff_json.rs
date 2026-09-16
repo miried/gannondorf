@@ -64,6 +64,11 @@ fn run() -> Result<()> {
         let text = fs::read_to_string(map)
             .map_err(|err| Error::new(format!("failed to read `{}`: {err}", map.display())))?;
         let mapping = parse_mapping_file(&text)?;
+        if !mapping.data.is_empty() {
+            return Err(Error::new(
+                "data mappings are parsed but objdiff data symbol resolution is not implemented yet",
+            ));
+        }
 
         if mapping.map.is_empty() {
             if remove_objdiff_unit(&mut config, &paths) {
