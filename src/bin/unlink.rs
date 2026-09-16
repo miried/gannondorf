@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use gannondorf::{
     Error, FunctionMapping, MappingEntry, Result, default_output_path, extract_function_object,
-    extract_function_objects, extract_functions_object, parse_address, parse_mapping_file,
+    extract_function_objects, extract_functions_object, extract_mapped_object, parse_address,
+    parse_mapping_file,
 };
 
 #[derive(Debug, Parser)]
@@ -134,18 +135,13 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
     let text = fs::read_to_string(map)
         .map_err(|err| Error::new(format!("failed to read `{}`: {err}", map.display())))?;
     let mapping = parse_mapping_file(&text)?;
-    if !mapping.data.is_empty() {
-        return Err(Error::new(
-            "data mappings are parsed but data extraction is not implemented yet",
-        ));
-    }
     let output = output
         .map(PathBuf::from)
         .unwrap_or_else(|| default_map_output_path(map));
 
-    if mapping.map.is_empty() {
+    if mapping.map.is_empty() && mapping.data.is_empty() {
         println!(
-            "skipped {} because it does not contain mapped functions",
+            "skipped {} because it does not contain mapped functions or data",
             map.display()
         );
         return Ok(());
@@ -155,7 +151,7 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
     let input_bytes = fs::read(&input_exe)
         .map_err(|err| Error::new(format!("failed to read `{}`: {err}", input_exe.display())))?;
     let addresses = unique_map_addresses(&mapping.map);
-    let extracted = extract_functions_object(&input_bytes, &addresses)?;
+    let extracted = extract_mapped_object(&input_bytes, &addresses, &mapping.data)?;
     fs::write(&output, &extracted.bytes)
         .map_err(|err| Error::new(format!("failed to write `{}`: {err}", output.display())))?;
 
@@ -166,9 +162,10 @@ fn extract_map_object(input: &Path, map: &Path, output: Option<&Path>) -> Result
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "wrote {} function(s) ({}) from {} to {}",
+        "wrote {} function(s) ({}) and {} data symbol(s) from {} to {}",
         extracted.functions.len(),
         names,
+        mapping.data.len(),
         input_exe.display(),
         output.display()
     );

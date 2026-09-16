@@ -15,7 +15,7 @@ use object::{
     SectionKind, SymbolFlags, SymbolKind, SymbolScope,
 };
 
-use crate::{Error, Result};
+use crate::{DataMappingEntry, Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedObject {
@@ -66,6 +66,7 @@ struct PeI386Image<'data> {
 struct ImageSection<'data> {
     address: u64,
     data: &'data [u8],
+    size: u64,
     kind: SectionKind,
 }
 
@@ -154,6 +155,56 @@ pub fn extract_functions_object(
     write_extracted_multi_object(&functions, &image)
 }
 
+/// Extract selected functions and explicitly sized globals (addresses may be VAs or RVAs).
+pub fn extract_mapped_object(
+    image: &[u8],
+    addresses: &[u64],
+    data: &[DataMappingEntry],
+) -> Result<ExtractedMultiObject> {
+    let image = PeI386Image::parse(image)?;
+    let mut addresses: Vec<_> = addresses
+        .iter()
+        .map(|&a| normalize_address(a, image.image_base))
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let functions = addresses
+        .into_iter()
+        .map(|a| image.decode_function(a))
+        .collect::<Result<Vec<_>>>()?;
+    let mut data = data.to_vec();
+    for entry in &mut data {
+        entry.address = normalize_address(entry.address, image.image_base);
+    }
+    data.sort_by_key(|e| e.address);
+    for entry in &data {
+        if entry.size == 0 || entry.address.checked_add(entry.size).is_none() {
+            return Err(Error::new(format!(
+                "invalid data range for `{}`",
+                entry.name
+            )));
+        }
+    }
+    for pair in data.windows(2) {
+        if pair[0].address + pair[0].size > pair[1].address {
+            return Err(Error::new(format!(
+                "overlapping data ranges: `{}` [0x{:08X}, 0x{:08X}) and `{}` [0x{:08X}, 0x{:08X})",
+                pair[0].name,
+                pair[0].address,
+                pair[0].address + pair[0].size,
+                pair[1].name,
+                pair[1].address,
+                pair[1].address + pair[1].size
+            )));
+        }
+    }
+    let bytes = write_coff_object(&functions, &image.sections, &image.base_relocations, &data)?;
+    Ok(ExtractedMultiObject {
+        functions: functions.iter().map(describe_extracted_function).collect(),
+        bytes,
+    })
+}
+
 pub fn discover_function_addresses(image: &[u8]) -> Result<Vec<u64>> {
     let image = PeI386Image::parse(image)?;
     Ok(discover_function_images(&image)?.keys().copied().collect())
@@ -235,6 +286,7 @@ fn write_extracted_object(
         std::slice::from_ref(function),
         &image.sections,
         &image.base_relocations,
+        &[],
     )?;
 
     Ok(ExtractedObject {
@@ -249,7 +301,7 @@ fn write_extracted_multi_object(
     functions: &[FunctionImage],
     image: &PeI386Image<'_>,
 ) -> Result<ExtractedMultiObject> {
-    let bytes = write_coff_object(functions, &image.sections, &image.base_relocations)?;
+    let bytes = write_coff_object(functions, &image.sections, &image.base_relocations, &[])?;
     Ok(ExtractedMultiObject {
         functions: functions.iter().map(describe_extracted_function).collect(),
         bytes,
@@ -460,6 +512,7 @@ fn collect_sections<'data>(file: &PeFile32<'data>) -> Result<Vec<ImageSection<'d
     for section in file.sections() {
         sections.push(ImageSection {
             address: section.address(),
+            size: section.size(),
             data: section
                 .data()
                 .map_err(|err| Error::new(format!("failed to read section data: {err}")))?,
@@ -1232,8 +1285,9 @@ fn write_coff_object(
     functions: &[FunctionImage],
     sections: &[ImageSection<'_>],
     base_relocations: &[u64],
+    data: &[DataMappingEntry],
 ) -> Result<Vec<u8>> {
-    if functions.is_empty() {
+    if functions.is_empty() && data.is_empty() {
         return Err(Error::new("at least one function is required"));
     }
     for function in functions {
@@ -1272,6 +1326,101 @@ fn write_coff_object(
         });
     }
 
+    // PE raw padding is initialized storage; only the virtual tail is zero-fill.
+    let mut data_layouts = Vec::new();
+    for entry in data {
+        let section = sections
+            .iter()
+            .find(|s| contains_range(s.address, s.size, entry.address, entry.size))
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "data range `{}` at 0x{:08X} is not contained in one PE section",
+                    entry.name, entry.address
+                ))
+            })?;
+        if !matches!(
+            section.kind,
+            SectionKind::Data | SectionKind::ReadOnlyData | SectionKind::UninitializedData
+        ) {
+            return Err(Error::new(format!(
+                "data range `{}` is in unsupported section {:?}",
+                entry.name, section.kind
+            )));
+        }
+        let start = (entry.address - section.address) as usize;
+        let zero_fill = start >= section.data.len();
+        let standard = if zero_fill {
+            write::StandardSection::UninitializedData
+        } else if section.kind == SectionKind::ReadOnlyData {
+            write::StandardSection::ReadOnlyData
+        } else {
+            write::StandardSection::Data
+        };
+        let output_section = object.section_id(standard);
+        let output_offset = if zero_fill {
+            object.append_section_bss(output_section, entry.size, 1)
+        } else {
+            let mut bytes = vec![0; entry.size as usize];
+            let count = bytes.len().min(section.data.len() - start);
+            bytes[..count].copy_from_slice(&section.data[start..start + count]);
+            object.append_section_data(output_section, &bytes, 1)
+        };
+        let symbol = object.add_symbol(write::Symbol {
+            name: data_symbol_name(entry.address).into_bytes(),
+            value: output_offset,
+            size: entry.size,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: write::SymbolSection::Section(output_section),
+            flags: SymbolFlags::None,
+        });
+        symbols.insert((SymbolKind::Data, entry.address), symbol);
+        data_layouts.push((entry, output_section, output_offset, zero_fill));
+    }
+    for &(entry, output_section, output_offset, zero_fill) in &data_layouts {
+        for &va in base_relocations {
+            if va < entry.address + entry.size && va + 4 > entry.address {
+                if !contains_range(entry.address, entry.size, va, 4) || zero_fill {
+                    return Err(Error::new(format!(
+                        "base relocation at 0x{va:08X} crosses or lacks initialized storage in `{}`",
+                        entry.name
+                    )));
+                }
+                let offset = output_offset + va - entry.address;
+                let target =
+                    read_u32(object.section(output_section).data(), offset as usize)? as u64;
+                let (target, addend) = data_target(data, target);
+                let kind = if address_is_text(sections, target) {
+                    SymbolKind::Text
+                } else {
+                    SymbolKind::Data
+                };
+                let symbol = target_symbol(&mut object, &mut symbols, &layouts, text, kind, target);
+                write_u32(
+                    object.section_mut(output_section).data_mut(),
+                    offset as usize,
+                    0,
+                )?;
+                object
+                    .add_relocation(
+                        output_section,
+                        write::Relocation {
+                            offset,
+                            symbol,
+                            addend,
+                            flags: RelocationFlags::Generic {
+                                kind: RelocationKind::Absolute,
+                                encoding: RelocationEncoding::Generic,
+                                size: 32,
+                            },
+                        },
+                    )
+                    .map_err(|e| Error::new(format!("failed to add data relocation: {e}")))?;
+            }
+        }
+    }
+
     let mut relocated_offsets = HashSet::new();
 
     for (index, function) in functions.iter().enumerate() {
@@ -1287,6 +1436,7 @@ fn write_coff_object(
                 .checked_add(function_offset)
                 .ok_or_else(|| Error::new("absolute relocation offset overflowed"))?;
             let target_va = read_u32(&function.bytes, function_offset as usize)? as u64;
+            let (target_va, addend) = data_target(data, target_va);
             let kind = if address_is_text(sections, target_va) {
                 SymbolKind::Text
             } else {
@@ -1304,7 +1454,7 @@ fn write_coff_object(
                     write::Relocation {
                         offset: object_offset,
                         symbol,
-                        addend: 0,
+                        addend,
                         flags: RelocationFlags::Generic {
                             kind: RelocationKind::Absolute,
                             encoding: RelocationEncoding::Generic,
@@ -1377,6 +1527,12 @@ fn write_coff_object(
     object
         .write()
         .map_err(|err| Error::new(format!("failed to write COFF object: {err}")))
+}
+
+fn data_target(data: &[DataMappingEntry], va: u64) -> (u64, i64) {
+    data.iter()
+        .find(|e| contains_range(e.address, e.size, va, 1))
+        .map_or((va, 0), |e| (e.address, (va - e.address) as i64))
 }
 
 fn function_is_extractable(function: &FunctionImage) -> bool {
@@ -1735,11 +1891,13 @@ mod tests {
         let text = ImageSection {
             address: 0x1000,
             data: &text_bytes,
+            size: text_bytes.len() as u64,
             kind: SectionKind::Text,
         };
         let data = ImageSection {
             address: 0x2000,
             data: &data_bytes,
+            size: data_bytes.len() as u64,
             kind: SectionKind::Data,
         };
 
@@ -1773,6 +1931,7 @@ mod tests {
         let text = ImageSection {
             address: 0x1000,
             data: &bytes,
+            size: bytes.len() as u64,
             kind: SectionKind::Text,
         };
         let function_starts = BTreeSet::from([0x1010]);
@@ -1876,6 +2035,7 @@ mod tests {
         let section = ImageSection {
             address: 0x1000,
             data: bytes,
+            size: bytes.len() as u64,
             kind: SectionKind::Text,
         };
         decode_function(
@@ -1893,5 +2053,115 @@ mod tests {
             .iter()
             .map(|instruction| instruction.va - function.va)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod data_extraction_tests {
+    use super::*;
+    use object::{ObjectSymbol as _, RelocationTarget};
+
+    #[test]
+    fn storage_and_pointer_relocations_preserve_interior_offsets() {
+        let mut raw = vec![0; 24];
+        raw[..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0x2010u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&11u32.to_le_bytes());
+        raw[12..16].copy_from_slice(&22u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&33u32.to_le_bytes());
+        raw[20..24].copy_from_slice(&44u32.to_le_bytes());
+        let sections = [ImageSection {
+            address: 0x2000,
+            data: &raw,
+            size: 32,
+            kind: SectionKind::Data,
+        }];
+        let data: Vec<_> = [
+            ("integer", 0x2000, 4),
+            ("pointer", 0x2004, 4),
+            ("array", 0x2008, 16),
+            ("zero", 0x2018, 8),
+        ]
+        .into_iter()
+        .map(|(name, address, size)| DataMappingEntry {
+            name: name.into(),
+            address,
+            size,
+        })
+        .collect();
+        let function = FunctionImage {
+            va: 0x1000,
+            bytes: vec![0xa1, 0x10, 0x20, 0, 0, 0xc3],
+            instructions: vec![],
+        };
+        let bytes = write_coff_object(&[function], &sections, &[0x1001, 0x2004], &data).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let initialized = file.section_by_name(".data").unwrap();
+        let contents = initialized.data().unwrap();
+        assert_eq!(&contents[..4], &0x12345678u32.to_le_bytes());
+        assert_eq!(&contents[8..24], &raw[8..24]);
+        let bss = file.section_by_name(".bss").unwrap();
+        assert_eq!(bss.size(), 8);
+        assert!(bss.data().unwrap().is_empty());
+        for section in [initialized, file.section_by_name(".text").unwrap()] {
+            let relocations: Vec<_> = section.relocations().collect();
+            assert_eq!(relocations.len(), 1);
+            let (offset, relocation) = &relocations[0];
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                panic!()
+            };
+            let symbol = file.symbol_by_index(index).unwrap();
+            assert_eq!(symbol.name().unwrap(), "data_00002008");
+            assert!(!symbol.is_undefined());
+            assert_eq!(
+                read_u32(section.data().unwrap(), *offset as usize).unwrap(),
+                8
+            );
+        }
+        for entry in &data {
+            assert!(
+                !file
+                    .symbols()
+                    .find(|s| s.name().unwrap() == data_symbol_name(entry.address))
+                    .unwrap()
+                    .is_undefined()
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_mixed_storage_and_invalid_ranges() {
+        let raw = [1, 2, 3, 4];
+        let sections = [ImageSection {
+            address: 0x2000,
+            data: &raw,
+            size: 8,
+            kind: SectionKind::ReadOnlyData,
+        }];
+        let mut entry = DataMappingEntry {
+            name: "mixed".into(),
+            address: 0x2000,
+            size: 8,
+        };
+        let bytes = write_coff_object(&[], &sections, &[], &[entry.clone()]).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            file.section_by_name(".rdata").unwrap().data().unwrap(),
+            &[1, 2, 3, 4, 0, 0, 0, 0]
+        );
+        entry.size = 9;
+        assert!(
+            write_coff_object(&[], &sections, &[], &[entry.clone()])
+                .unwrap_err()
+                .to_string()
+                .contains("not contained")
+        );
+        entry.size = 2;
+        assert!(
+            write_coff_object(&[], &sections, &[0x2000], &[entry])
+                .unwrap_err()
+                .to_string()
+                .contains("crosses")
+        );
     }
 }

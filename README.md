@@ -61,7 +61,7 @@ directory and extract all mapped functions into one object:
 unlink tests/bin --map build/maps/mapping_test.map -o target/mapping_test.obj
 ```
 
-### Sized data mappings (parser support)
+### Sized data mappings
 
 `cxxmap` also accepts `//! DATA <address> <byte-size>` immediately before a
 single variable declaration, including initialized globals and arrays:
@@ -93,11 +93,28 @@ data = {
 Data-only mappings are supported. Identical repeated data declarations are
 deduplicated; conflicting addresses or sizes for the same name are errors.
 Multiple declarators, typedefs, functions and function pointers are rejected.
-Range-overlap detection remains part of the planned extraction work.
+`unlink --map` extracts globals as defined `data_XXXXXXXX` symbols. It rejects
+overlapping ranges (including aliases), ranges outside one PE section, and data
+in executable or unsupported sections, before writing the output file.
 
-This implements mapping support only: `unlink` and `objdiff-json` currently
-reject maps containing data with an explicit unsupported-operation error,
-preserving existing outputs. They continue to accept legacy function-only maps.
+Initialized bytes go into `.data` or `.rdata`; objects wholly in a PE section's
+virtual zero-fill tail go into `.bss`. Objects spanning initialized bytes and
+the virtual tail retain one symbol and are emitted with explicit trailing zeros.
+File-backed zero bytes remain initialized: a linked PE cannot reliably reveal
+whether those bytes originally belonged to a compiler `.bss` contribution.
+
+PE HIGHLOW base relocations in mapped data become COFF DIR32 relocations, as do
+absolute references from extracted code. References inside a mapped global use
+its base symbol and byte offset, including forward references and self pointers.
+Unmapped targets retain synthetic external symbols. A relocation crossing a
+mapped data boundary is an error. Relocations stripped from the PE cannot be
+recovered by guessing which integers are pointers.
+
+The library exposes `extract_mapped_object(image, addresses, data)` for mixed or
+data-only extraction; function-only extraction APIs retain their behavior.
+
+`objdiff-json` still rejects maps containing data pending decorated data-symbol
+resolution. Both tools continue to accept legacy function-only maps.
 The public `FunctionMapping` type retains its name and function `map` field and
 adds a separate `Vec<DataMappingEntry>` named `data`.
 

@@ -28,7 +28,7 @@ static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();
 const KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES: &[u64] = &[];
 
 #[test]
-fn cxxmap_preserves_sized_globals_and_consumers_reject_unsupported_data() {
+fn cxxmap_preserves_sized_globals_and_objdiff_rejects_unsupported_data() {
     let dir = new_test_dir("data-mapping");
     let source = dir.join("globals.cpp");
     fs::write(&source, include_str!("fixtures/globals_mapping.cpp")).unwrap();
@@ -63,10 +63,7 @@ fn cxxmap_preserves_sized_globals_and_consumers_reject_unsupported_data() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert_contains(
-        &combined_output(&output),
-        "data extraction is not implemented yet",
-    );
+    assert_contains(&combined_output(&output), "failed to read");
     assert_eq!(fs::read(&target).unwrap(), b"existing target");
     let output = Command::new(env!("CARGO_BIN_EXE_objdiff-json"))
         .arg("--json")
@@ -2116,4 +2113,72 @@ impl fmt::Display for DisplayStatus {
             None => f.write_str("terminated by signal"),
         }
     }
+}
+
+#[test]
+fn mapped_data_cli_extracts_storage_and_rejects_overlaps_without_clobbering() {
+    let build = compile_fixture("basic.cpp");
+    let image_bytes = fs::read(&build.exe).unwrap();
+    let pe = object::File::parse(image_bytes.as_slice()).unwrap();
+    let function_va = linked_va_for_source_symbol(&build, "_fixture_uses_global");
+    let text = pe.section_by_name(".text").unwrap();
+    let code = &text.data().unwrap()[(function_va - text.address()) as usize..];
+    let mut decoder = Decoder::with_ip(32, code, function_va, DecoderOptions::NONE);
+    let va = loop {
+        let instruction = decoder.decode();
+        assert!(!instruction.is_invalid());
+        if instruction.memory_base() == iced_x86::Register::None
+            && instruction.memory_displacement64() != 0
+        {
+            break instruction.memory_displacement64();
+        }
+    };
+    let map = build.dir.join("data.map");
+    let output = build.dir.join("data.obj");
+    fs::write(
+        &map,
+        format!("data = {{\n\"value\": {{\"address\": {va}, \"size\": 4}},\n}}\n"),
+    )
+    .unwrap();
+    run_unlink_map(&build.exe, &map, &output);
+    let bytes = fs::read(&output).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    let symbol = file
+        .symbols()
+        .find(|s| s.name().unwrap() == format!("data_{va:08X}"))
+        .unwrap();
+    assert!(!symbol.is_undefined());
+    let section = file
+        .section_by_index(symbol.section_index().unwrap())
+        .unwrap();
+    assert_eq!(
+        &section.data().unwrap()[symbol.address() as usize..symbol.address() as usize + 4],
+        &11u32.to_le_bytes()
+    );
+    let image = fs::read(&build.exe).unwrap();
+    let entry = gannondorf::DataMappingEntry {
+        name: "value".into(),
+        address: va - image_base(&build.exe),
+        size: 4,
+    };
+    assert_eq!(
+        gannondorf::extract_mapped_object(&image, &[], &[entry])
+            .unwrap()
+            .bytes,
+        bytes
+    );
+    fs::write(&map, format!("data = {{\n\"value\": {{\"address\": {va}, \"size\": 4}},\n\"alias\": {{\"address\": {}, \"size\": 4}},\n}}\n",va+2)).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_unlink"))
+        .arg(&build.exe)
+        .arg("--map")
+        .arg(&map)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_contains(&combined_output(&result), "overlapping data ranges");
+    assert_contains(&combined_output(&result), "value");
+    assert_contains(&combined_output(&result), "alias");
+    assert_eq!(fs::read(&output).unwrap(), bytes);
 }
