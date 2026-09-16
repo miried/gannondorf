@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gannondorf::{Error, MappingEntry, Result, parse_mapping_file};
+use gannondorf::{Error, FunctionMapping, MappingEntry, Result, parse_mapping_file};
 use object::{Object, ObjectSymbol, SymbolKind};
 use serde_json::{Map, Value};
 
@@ -64,13 +64,7 @@ fn run() -> Result<()> {
         let text = fs::read_to_string(map)
             .map_err(|err| Error::new(format!("failed to read `{}`: {err}", map.display())))?;
         let mapping = parse_mapping_file(&text)?;
-        if !mapping.data.is_empty() {
-            return Err(Error::new(
-                "data mappings are parsed but objdiff data symbol resolution is not implemented yet",
-            ));
-        }
-
-        if mapping.map.is_empty() {
+        if mapping.map.is_empty() && mapping.data.is_empty() {
             if remove_objdiff_unit(&mut config, &paths) {
                 changed_units += 1;
                 println!(
@@ -82,7 +76,7 @@ fn run() -> Result<()> {
             continue;
         }
 
-        let unit = build_objdiff_unit(paths, &mapping.map)?;
+        let unit = build_objdiff_unit(paths, &mapping)?;
         upsert_objdiff_unit(&mut config, unit)?;
         changed_units += 1;
         println!("updated objdiff unit from {}", map.display());
@@ -123,14 +117,29 @@ fn objdiff_paths_for_map(args: &Args, map: &Path) -> ObjdiffPaths {
     }
 }
 
-fn build_objdiff_unit(paths: ObjdiffPaths, entries: &[MappingEntry]) -> Result<ObjdiffUnit> {
+fn build_objdiff_unit(paths: ObjdiffPaths, mapping: &FunctionMapping) -> Result<ObjdiffUnit> {
     let base_symbols = load_base_symbols(&paths.base_path)?;
     let mut symbol_mappings = Map::new();
 
-    for entry in unique_entries_by_address(entries) {
+    for entry in unique_entries_by_address(&mapping.map) {
         symbol_mappings.insert(
             code_symbol_name(entry.address),
-            Value::String(resolve_base_symbol(&entry.name, &base_symbols)),
+            Value::String(resolve_base_symbol(
+                &entry.name,
+                &base_symbols,
+                SymbolKind::Text,
+            )),
+        );
+    }
+
+    for entry in &mapping.data {
+        symbol_mappings.insert(
+            format!("data_{:08X}", entry.address),
+            Value::String(resolve_base_symbol(
+                &entry.name,
+                &base_symbols,
+                SymbolKind::Data,
+            )),
         );
     }
 
@@ -148,7 +157,7 @@ fn unique_entries_by_address(entries: &[MappingEntry]) -> Vec<&MappingEntry> {
         .collect()
 }
 
-fn load_base_symbols(base_path: &Path) -> Result<Vec<String>> {
+fn load_base_symbols(base_path: &Path) -> Result<Vec<(String, SymbolKind)>> {
     if !base_path.exists() {
         return Ok(Vec::new());
     }
@@ -160,13 +169,30 @@ fn load_base_symbols(base_path: &Path) -> Result<Vec<String>> {
 
     Ok(file
         .symbols()
-        .filter(|symbol| symbol.kind() == SymbolKind::Text)
-        .filter_map(|symbol| symbol.name().ok().map(str::to_owned))
+        .filter(|symbol| matches!(symbol.kind(), SymbolKind::Text | SymbolKind::Data))
+        .filter_map(|symbol| {
+            symbol
+                .name()
+                .ok()
+                .map(|name| (name.to_owned(), symbol.kind()))
+        })
         .collect())
 }
 
-fn resolve_base_symbol(source_name: &str, base_symbols: &[String]) -> String {
-    if base_symbols.iter().any(|symbol| symbol == source_name) {
+fn resolve_base_symbol(
+    source_name: &str,
+    base_symbols: &[(String, SymbolKind)],
+    kind: SymbolKind,
+) -> String {
+    let base_symbols = base_symbols
+        .iter()
+        .filter(|(_, candidate_kind)| *candidate_kind == kind)
+        .map(|(name, _)| name)
+        .collect::<BTreeSet<_>>();
+    if base_symbols
+        .iter()
+        .any(|symbol| symbol.as_str() == source_name)
+    {
         return source_name.to_owned();
     }
 
@@ -175,7 +201,7 @@ fn resolve_base_symbol(source_name: &str, base_symbols: &[String]) -> String {
         .filter(|symbol| symbol_matches_source_name(symbol, source_name))
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [symbol] => (*symbol).clone(),
+        [symbol] => (**symbol).clone(),
         _ => source_name.to_owned(),
     }
 }
@@ -360,4 +386,48 @@ fn code_symbol_name(va: u64) -> String {
 
 fn json_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_data_by_kind_without_guessing_ambiguous_names() {
+        let symbols = vec![
+            ("?value@@3HA".into(), SymbolKind::Data),
+            ("?value@@YAHXZ".into(), SymbolKind::Text),
+            ("_plain".into(), SymbolKind::Data),
+            ("?shared@A@@2HA".into(), SymbolKind::Data),
+            ("?shared@B@@2HA".into(), SymbolKind::Data),
+            ("?values@@3PAHA".into(), SymbolKind::Data),
+            ("_prefixExtra".into(), SymbolKind::Data),
+        ];
+        for (source, expected) in [
+            ("value", "?value@@3HA"),
+            ("plain", "_plain"),
+            ("values", "?values@@3PAHA"),
+            ("shared", "shared"),
+            ("prefix", "prefix"),
+            ("missing", "missing"),
+            ("?value@@3HA", "?value@@3HA"),
+        ] {
+            assert_eq!(
+                resolve_base_symbol(source, &symbols, SymbolKind::Data),
+                expected
+            );
+        }
+        assert_eq!(
+            resolve_base_symbol("value", &symbols, SymbolKind::Text),
+            "?value@@YAHXZ"
+        );
+        let exact = vec![
+            ("plain".into(), SymbolKind::Data),
+            ("_plain".into(), SymbolKind::Data),
+        ];
+        assert_eq!(
+            resolve_base_symbol("plain", &exact, SymbolKind::Data),
+            "plain"
+        );
+    }
 }

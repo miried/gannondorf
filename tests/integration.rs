@@ -28,7 +28,7 @@ static TI_FUNCTION_COMPARISON: OnceLock<TiFunctionComparison> = OnceLock::new();
 const KNOWN_TI_DISASSEMBLY_BYTE_DIFFERENCES: &[u64] = &[];
 
 #[test]
-fn cxxmap_preserves_sized_globals_and_objdiff_rejects_unsupported_data() {
+fn cxxmap_preserves_sized_globals_and_objdiff_maps_missing_base_symbols() {
     let dir = new_test_dir("data-mapping");
     let source = dir.join("globals.cpp");
     fs::write(&source, include_str!("fixtures/globals_mapping.cpp")).unwrap();
@@ -71,12 +71,13 @@ fn cxxmap_preserves_sized_globals_and_objdiff_rejects_unsupported_data() {
         .arg(&map)
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert_contains(
-        &combined_output(&output),
-        "data symbol resolution is not implemented yet",
-    );
-    assert_eq!(fs::read(&config).unwrap(), b"{\"units\": []}\n");
+    assert_success("map globals without base object", &output);
+    let config: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    let mappings = &unit_by_name(&config, "globals")["symbol_mappings"];
+    assert_eq!(mappings["data_00402000"], "initialized");
+    assert_eq!(mappings["data_00402008"], "values");
+    assert_eq!(mappings["data_00402018"], "uninitialized");
+    assert_eq!(mappings["sub_00401000"], "entry");
 }
 const EXPECTED_TI_COMMON_FUNCTIONS: usize = 1471;
 const EXPECTED_TI_SCANNER_ONLY_FUNCTIONS: &[u64] = &[
@@ -2181,4 +2182,178 @@ fn mapped_data_cli_extracts_storage_and_rejects_overlaps_without_clobbering() {
     assert_contains(&combined_output(&result), "value");
     assert_contains(&combined_output(&result), "alias");
     assert_eq!(fs::read(&output).unwrap(), bytes);
+}
+
+#[test]
+fn objdiff_globals_resolve_storage_and_code_relocation_targets() {
+    let build = compile_fixture("objdiff_globals.cpp");
+    let base_bytes = fs::read(&build.obj).unwrap();
+    let base = object::File::parse(base_bytes.as_slice()).unwrap();
+    let image_bytes = fs::read(&build.exe).unwrap();
+    let image = object::File::parse(image_bytes.as_slice()).unwrap();
+    let function_va = linked_va_for_source_symbol(&build, "_entry");
+    let base_text = base.section_by_name(".text").unwrap();
+    let image_text = image.section_by_name(".text").unwrap();
+    let source_offset = object_symbol_offset(&build.obj, "_entry");
+    let globals = [
+        ("initialized", "?initialized@@3HC", 4usize),
+        ("uninitialized", "?uninitialized@@3HC", 4),
+        ("values", "_values", 16),
+    ];
+    let mut addresses = BTreeMap::new();
+    let mut expected_relocations = Vec::new();
+    for (offset, relocation) in base_text.relocations() {
+        let object::RelocationTarget::Symbol(index) = relocation.target() else {
+            continue;
+        };
+        let symbol = base.symbol_by_index(index).unwrap();
+        let name = symbol.name().unwrap();
+        if !globals.iter().any(|(_, decorated, _)| *decorated == name) {
+            continue;
+        }
+        let addend = u32::from_le_bytes(
+            base_text.data().unwrap()[offset as usize..offset as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let image_offset = (function_va - image_text.address() + offset - source_offset) as usize;
+        let linked = u32::from_le_bytes(
+            image_text.data().unwrap()[image_offset..image_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let address = u64::from(linked - addend);
+        if let Some(previous) = addresses.insert(name.to_owned(), address) {
+            assert_eq!(previous, address);
+        }
+        expected_relocations.push((name.to_owned(), addend));
+    }
+    assert_eq!(addresses.len(), 3);
+    assert!(expected_relocations.contains(&("_values".into(), 8)));
+    let data = globals
+        .iter()
+        .map(|(name, decorated, size)| gannondorf::DataMappingEntry {
+            name: (*name).into(),
+            address: addresses[*decorated],
+            size: *size as u64,
+        })
+        .collect::<Vec<_>>();
+    let mapping = gannondorf::FunctionMapping {
+        binary: None,
+        map: vec![gannondorf::MappingEntry {
+            name: "entry".into(),
+            address: function_va,
+        }],
+        data,
+    };
+    let extracted =
+        gannondorf::extract_mapped_object(&image_bytes, &[function_va], &mapping.data).unwrap();
+    let target = object::File::parse(extracted.bytes.as_slice()).unwrap();
+    let map = build.dir.join("objdiff_globals.map");
+    // Exercise mixed and data-only maps, followed by the existing empty-map removal behavior.
+    for data_only in [false, true] {
+        let mut map_text = String::new();
+        if !data_only {
+            map_text.push_str(&format!("map = {{\n\"entry\": {function_va},\n}}\n"));
+        }
+        map_text.push_str("data = {\n");
+        for entry in &mapping.data {
+            map_text.push_str(&format!(
+                "\"{}\": {{\"address\": {}, \"size\": {}}},\n",
+                entry.name, entry.address, entry.size
+            ));
+        }
+        map_text.push_str("}\n");
+        fs::write(&map, map_text).unwrap();
+        let config_path = build.dir.join("objdiff.json");
+        let run = || {
+            Command::new(env!("CARGO_BIN_EXE_objdiff-json"))
+                .arg("--json")
+                .arg(&config_path)
+                .arg("--build-dir")
+                .arg(&build.dir)
+                .arg(&map)
+                .output()
+                .unwrap()
+        };
+        assert_success("generate global mappings", &run());
+        let config_bytes = fs::read(&config_path).unwrap();
+        assert_success("repeat global mappings", &run());
+        assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+        let config: Value = serde_json::from_slice(&config_bytes).unwrap();
+        let mappings = &unit_by_name(&config, "objdiff_globals")["symbol_mappings"];
+        assert_eq!(
+            mappings.as_object().unwrap().len(),
+            if data_only { 3 } else { 4 }
+        );
+        if !data_only {
+            assert_eq!(mappings[format!("sub_{function_va:08X}")], "_entry");
+        }
+        for (_, decorated, size) in globals {
+            let target_name = format!("data_{:08X}", addresses[decorated]);
+            assert_eq!(mappings[&target_name], decorated);
+            let original = base.symbols().find(|s| s.name() == Ok(decorated)).unwrap();
+            let extracted = target
+                .symbols()
+                .find(|s| s.name() == Ok(target_name.as_str()))
+                .unwrap();
+            assert!(!extracted.is_undefined());
+            let original_section = base
+                .section_by_index(original.section_index().unwrap())
+                .unwrap();
+            let extracted_section = target
+                .section_by_index(extracted.section_index().unwrap())
+                .unwrap();
+            let original_contents = if original_section.kind() == SectionKind::UninitializedData {
+                vec![0; size]
+            } else {
+                original_section.data().unwrap()
+                    [original.address() as usize..original.address() as usize + size]
+                    .to_vec()
+            };
+            let extracted_contents = if extracted_section.kind() == SectionKind::UninitializedData {
+                vec![0; size]
+            } else {
+                extracted_section.data().unwrap()
+                    [extracted.address() as usize..extracted.address() as usize + size]
+                    .to_vec()
+            };
+            assert_eq!(
+                extracted_contents, original_contents,
+                "storage for {decorated}"
+            );
+        }
+        let text = target.section_by_name(".text").unwrap();
+        let actual = text
+            .relocations()
+            .map(|(offset, relocation)| {
+                let object::RelocationTarget::Symbol(index) = relocation.target() else {
+                    panic!("not a symbol")
+                };
+                let symbol = target.symbol_by_index(index).unwrap();
+                let decorated = mappings[symbol.name().unwrap()]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let addend = u32::from_le_bytes(
+                    text.data().unwrap()[offset as usize..offset as usize + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                (decorated, addend)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected_relocations);
+    }
+    fs::write(&map, "").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_objdiff-json"))
+        .arg("--json")
+        .arg(build.dir.join("objdiff.json"))
+        .arg(&map)
+        .output()
+        .unwrap();
+    assert_success("remove empty data unit", &output);
+    let config: Value =
+        serde_json::from_slice(&fs::read(build.dir.join("objdiff.json")).unwrap()).unwrap();
+    assert!(config["units"].as_array().unwrap().is_empty());
 }

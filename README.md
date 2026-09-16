@@ -113,8 +113,11 @@ recovered by guessing which integers are pointers.
 The library exposes `extract_mapped_object(image, addresses, data)` for mixed or
 data-only extraction; function-only extraction APIs retain their behavior.
 
-`objdiff-json` still rejects maps containing data pending decorated data-symbol
-resolution. Both tools continue to accept legacy function-only maps.
+`objdiff-json` supports mixed and data-only maps as well as legacy function-only
+maps. It maps `data_XXXXXXXX` symbols to compiler data symbols, including C and
+MSVC C++ decorated names. Function and data candidates are resolved separately.
+Exact names take precedence; absent or ambiguous matches retain the source name,
+as do mappings generated before the compiler object exists.
 The public `FunctionMapping` type retains its name and function `map` field and
 adds a separate `Vec<DataMappingEntry>` named `data`.
 
