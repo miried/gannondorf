@@ -1,0 +1,26 @@
+// Bitmap/version directives exercise predefined types that VC6 RC does not
+// accept as opaque numeric-type .bin resources.
+1 BITMAP "input.bmp"
+1 VERSIONINFO
+ FILEVERSION 1,2,3,280
+ PRODUCTVERSION 4,5,6,7
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x2L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "LegalCopyright", L"Copyright \x00A9 \x263A\0"
+   VALUE "FileVersion", L"1.2.3.280\0"
+   VALUE "PrivateBuild", ""
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x409, 1200, 0x407, 1252
+ END
+END

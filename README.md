@@ -143,7 +143,13 @@ unres input.exe
 
 `unres` writes the `.rc` file, a sibling `resources.h` with generated resource
 ID definitions, and sidecar assets for binary resources such as icons, cursors,
-and raw resource data. By default, sidecar files are written next to the script
+bitmaps, and raw resource data. Bitmap payloads receive a BMP file header;
+version resources are rendered as `VERSIONINFO` with wide string values.
+These directives support both MSVC 4.2 and VC6 RC, which interprets the
+predefined numeric bitmap/version types rather than accepting opaque `.bin`
+files. Unsupported or malformed formats retain the raw-resource fallback;
+those statements may require manual editing for the selected RC version.
+By default, sidecar files are written next to the script
 in a `resources` directory, and the script is written as `resources.rc`.
 
 ## Testing

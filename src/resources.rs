@@ -280,6 +280,16 @@ fn render_resource_script(
             {
                 continue;
             }
+            ResourceKey::Id(pe::RT_BITMAP) => match build_bitmap_file(leaf.data) {
+                Ok(bytes) => renderer.render_bitmap(leaf, bytes),
+                Err(_) => renderer.render_raw_resource(leaf)?,
+            },
+            ResourceKey::Id(pe::RT_VERSION) => {
+                match render_version_resource(leaf, &mut renderer.definitions) {
+                    Ok(text) => renderer.render_text_resource(leaf.language, &text),
+                    Err(_) => renderer.render_raw_resource(leaf)?,
+                }
+            }
             ResourceKey::Id(pe::RT_STRING) => {
                 if !renderer.try_render_string_table(leaf).unwrap_or(false) {
                     renderer.render_raw_resource(leaf)?;
@@ -475,6 +485,19 @@ impl ResourceRenderer {
             escape_rc_text(&path)
         ));
         Ok(())
+    }
+
+    fn render_bitmap(&mut self, leaf: &ResourceLeaf<'_>, bytes: Vec<u8>) {
+        self.write_language(leaf.language);
+        let file_name = format!(
+            "bitmap_{}_lang_{:04X}.bmp",
+            resource_key_token(&leaf.name),
+            leaf.language
+        );
+        let path = self.add_asset(file_name, bytes);
+        let name = self.definitions.resource_key_reference(&leaf.name, "IDB");
+        self.rc_text
+            .push_str(&format!("{name} BITMAP \"{}\"\n\n", escape_rc_text(&path)));
     }
 
     fn render_raw_resource(&mut self, leaf: &ResourceLeaf<'_>) -> Result<()> {
@@ -847,6 +870,214 @@ impl fmt::Debug for ResourceRenderer {
             .field("current_language", &self.current_language)
             .finish_non_exhaustive()
     }
+}
+
+// Numeric predefined resource types are also special to VC6 RC: it parses
+// type 16 as VERSIONINFO and type 2 as BITMAP. A raw .bin filename is not a
+// portable substitute for either directive.
+fn build_bitmap_file(dib: &[u8]) -> Result<Vec<u8>> {
+    let header_size = read_u32_at(dib, 0)? as usize;
+    let (bits, colors, palette_entry, masks) = match header_size {
+        12 => (read_u16_at(dib, 10)?, 0, 3, 0),
+        40 | 52 | 56 | 108 | 124 => {
+            let compression = read_u32_at(dib, 16)?;
+            let masks = if header_size == 40 {
+                match compression {
+                    3 => 12,
+                    6 => 16,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            (
+                read_u16_at(dib, 14)?,
+                read_u32_at(dib, 32)? as usize,
+                4,
+                masks,
+            )
+        }
+        _ => return Err(Error::new("unsupported bitmap header")),
+    };
+    let colors = if colors == 0 && bits != 0 && bits <= 8 {
+        1usize << bits
+    } else {
+        colors
+    };
+    let pixel_offset = header_size
+        .checked_add(masks)
+        .and_then(|n| {
+            colors
+                .checked_mul(palette_entry)
+                .and_then(|palette| n.checked_add(palette))
+        })
+        .filter(|&n| n <= dib.len())
+        .ok_or_else(|| Error::new("bitmap palette extends past resource"))?;
+    let file_size = u32::try_from(dib.len().saturating_add(14))
+        .map_err(|_| Error::new("bitmap file size overflowed"))?;
+    let mut output = Vec::with_capacity(file_size as usize);
+    output.extend_from_slice(b"BM");
+    output.extend_from_slice(&file_size.to_le_bytes());
+    output.extend_from_slice(&[0; 4]);
+    output.extend_from_slice(&((pixel_offset + 14) as u32).to_le_bytes());
+    output.extend_from_slice(dib);
+    Ok(output)
+}
+
+struct VersionBlock<'a> {
+    key: Vec<u16>,
+    kind: u16,
+    value: &'a [u8],
+    children: Vec<VersionBlock<'a>>,
+}
+
+fn parse_version_block(data: &[u8], depth: usize) -> Result<VersionBlock<'_>> {
+    // Every child consumes a header and key; also bound recursion on hostile PEs.
+    if depth > 16 {
+        return Err(Error::new("version resource nesting is too deep"));
+    }
+    let length = read_u16_at(data, 0)? as usize;
+    let data = data
+        .get(..length)
+        .ok_or_else(|| Error::new("version block extends past resource"))?;
+    let value_length = read_u16_at(data, 2)? as usize;
+    let kind = read_u16_at(data, 4)?;
+    if kind > 1 {
+        return Err(Error::new("unsupported version value type"));
+    }
+    let mut offset = 6;
+    let key = read_utf16z(data, &mut offset)?;
+    let value_size = value_length * if kind == 1 { 2 } else { 1 };
+    // Leaf keys/values may end before their next DWORD boundary.
+    if value_size != 0 {
+        offset = (offset + 3) & !3;
+    }
+    let end = offset + value_size;
+    let value = data
+        .get(offset..end)
+        .ok_or_else(|| Error::new("version value extends past block"))?;
+    offset = end;
+    let mut children = Vec::new();
+    while offset < data.len() {
+        offset = (offset + 3) & !3;
+        if offset >= data.len() {
+            break;
+        }
+        let child_length = read_u16_at(data, offset)? as usize;
+        if child_length == 0 {
+            return Err(Error::new("empty version child block"));
+        }
+        let end = offset + child_length;
+        let child = data
+            .get(offset..end)
+            .ok_or_else(|| Error::new("version child extends past block"))?;
+        children.push(parse_version_block(child, depth + 1)?);
+        offset = end;
+    }
+    Ok(VersionBlock {
+        key,
+        kind,
+        value,
+        children,
+    })
+}
+
+fn render_version_resource(
+    leaf: &ResourceLeaf<'_>,
+    definitions: &mut ResourceDefinitions,
+) -> Result<String> {
+    let root = parse_version_block(leaf.data, 0)?;
+    if root.key != "VS_VERSION_INFO".encode_utf16().collect::<Vec<_>>()
+        || root.kind != 0
+        || root.value.len() != 52
+        || read_u32_at(root.value, 0)? != 0xFEEF04BD
+        || read_u32_at(root.value, 4)? != 0x00010000
+        || read_u32_at(root.value, 44)? != 0
+        || read_u32_at(root.value, 48)? != 0
+    {
+        return Err(Error::new("unsupported fixed version info"));
+    }
+    let name = definitions.resource_key_reference(&leaf.name, "IDR_VERSION");
+    let mut output = format!("{name} VERSIONINFO\n");
+    for (key, offset) in [("FILEVERSION", 8), ("PRODUCTVERSION", 16)] {
+        let high = read_u32_at(root.value, offset)?;
+        let low = read_u32_at(root.value, offset + 4)?;
+        output.push_str(&format!(
+            " {key} {}, {}, {}, {}\n",
+            high >> 16,
+            high & 0xffff,
+            low >> 16,
+            low & 0xffff
+        ));
+    }
+    for (key, offset) in [
+        ("FILEFLAGSMASK", 24),
+        ("FILEFLAGS", 28),
+        ("FILEOS", 32),
+        ("FILETYPE", 36),
+        ("FILESUBTYPE", 40),
+    ] {
+        output.push_str(&format!(
+            " {key} 0x{:08X}L\n",
+            read_u32_at(root.value, offset)?
+        ));
+    }
+    output.push_str("BEGIN\n");
+    for block in &root.children {
+        render_version_child(block, 1, &mut output)?;
+    }
+    output.push_str("END\n\n");
+    Ok(output)
+}
+
+fn render_version_child(block: &VersionBlock<'_>, depth: usize, output: &mut String) -> Result<()> {
+    let indent = "    ".repeat(depth);
+    let key = escape_rc_utf16_string(&block.key);
+    let key_literal = if block.key.iter().any(|&unit| unit > 0x7f) {
+        format!("L\"{key}\"")
+    } else {
+        format!("\"{key}\"")
+    };
+    // StringFileInfo, StringTable and VarFileInfo are containers even when empty.
+    if !block.children.is_empty() || (block.value.is_empty() && depth <= 2 && key != "Translation")
+    {
+        if !block.value.is_empty() {
+            return Err(Error::new("version container has a value"));
+        }
+        output.push_str(&format!("{indent}BLOCK {key_literal}\n{indent}BEGIN\n"));
+        for child in &block.children {
+            render_version_child(child, depth + 1, output)?;
+        }
+        output.push_str(&format!("{indent}END\n"));
+    } else if block.kind == 1 {
+        let units = block
+            .value
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect::<Vec<_>>();
+        output.push_str(&format!(
+            "{indent}VALUE {key_literal}, L\"{}\"\n",
+            escape_rc_utf16_string(&units)
+        ));
+    } else if key == "Translation" && block.value.len().is_multiple_of(4) && !block.value.is_empty()
+    {
+        let words = block
+            .value
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| format!("0x{:04X}", u16::from_le_bytes([p[0], p[1]])))
+            .collect::<Vec<_>>();
+        output.push_str(&format!(
+            "{indent}VALUE {key_literal}, {}\n",
+            words.join(", ")
+        ));
+    } else {
+        return Err(Error::new("unsupported binary version value"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1379,6 +1610,113 @@ fn push_flag_option<'a>(flags: u16, flag: u16, label: &'a str, options: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn version_block(key: &str, kind: u16, value: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
+        let mut data = vec![0; 6];
+        data[2..4]
+            .copy_from_slice(&((value.len() / if kind == 1 { 2 } else { 1 }) as u16).to_le_bytes());
+        data[4..6].copy_from_slice(&kind.to_le_bytes());
+        for unit in key.encode_utf16().chain(std::iter::once(0)) {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        if !value.is_empty() {
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+            data.extend_from_slice(value);
+        }
+        for child in children {
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+            data.extend_from_slice(child);
+        }
+        let len = data.len() as u16;
+        data[..2].copy_from_slice(&len.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn renders_version_strings_as_wide_literals_and_preserves_translation_pairs() {
+        let value = "Copyright © ☺\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let string = version_block("LegalCopyright", 1, &value, &[]);
+        let empty = version_block("PrivateBuild", 1, &[], &[]);
+        let table = version_block("040904b0", 1, &[], &[string, empty]);
+        let strings = version_block("StringFileInfo", 1, &[], &[table]);
+        let translation = version_block("Translation", 0, &[9, 4, 0xb0, 4, 7, 4, 0xe4, 4], &[]);
+        let vars = version_block("VarFileInfo", 1, &[], &[translation]);
+        let mut fixed = vec![0; 52];
+        fixed[..4].copy_from_slice(&0xFEEF04BDu32.to_le_bytes());
+        fixed[4..8].copy_from_slice(&0x00010000u32.to_le_bytes());
+        fixed[8..12].copy_from_slice(&0x00010002u32.to_le_bytes());
+        fixed[12..16].copy_from_slice(&0x00030118u32.to_le_bytes());
+        let data = version_block("VS_VERSION_INFO", 0, &fixed, &[strings, vars]);
+        let leaf = ResourceLeaf {
+            typ: ResourceKey::Id(pe::RT_VERSION),
+            name: ResourceKey::Id(1),
+            language: 0x0409,
+            data_rva: 0,
+            data: &data,
+        };
+        let result = render_resource_script(&[leaf], "assets").unwrap();
+        assert!(result.rc_text.contains("FILEVERSION 1, 2, 3, 280"));
+        assert!(
+            result
+                .rc_text
+                .contains(r#"VALUE "LegalCopyright", L"Copyright \x00A9 \x263A\x0000""#)
+        );
+        assert!(result.rc_text.contains(r#"VALUE "PrivateBuild", L"""#));
+        assert!(
+            result
+                .rc_text
+                .contains(r#"VALUE "Translation", 0x0409, 0x04B0, 0x0407, 0x04E4"#)
+        );
+        assert!(result.assets.is_empty());
+    }
+
+    #[test]
+    fn rejects_truncated_and_nonadvancing_version_blocks() {
+        for data in [&[][..], &[0; 6][..], &[20, 0, 0, 0, 0, 0][..]] {
+            assert!(parse_version_block(data, 0).is_err());
+        }
+        let mut container = version_block("StringFileInfo", 1, &[], &[]);
+        while container.len() % 4 != 0 {
+            container.push(0);
+        }
+        container.extend_from_slice(&[0; 6]);
+        let len = container.len() as u16;
+        container[..2].copy_from_slice(&len.to_le_bytes());
+        assert!(parse_version_block(&container, 0).is_err());
+    }
+
+    #[test]
+    fn restores_bitmap_file_header_without_changing_dib() {
+        for (header, bits, colors, compression, offset) in [
+            (12usize, 1u16, 0u32, 0u32, 18usize),
+            (40, 8, 3, 0, 52),
+            (40, 16, 0, 3, 52),
+            (40, 32, 0, 6, 56),
+            (108, 24, 0, 0, 108),
+        ] {
+            let mut dib = vec![0; offset + 4];
+            dib[..4].copy_from_slice(&(header as u32).to_le_bytes());
+            let bpp_offset = if header == 12 { 10 } else { 14 };
+            dib[bpp_offset..bpp_offset + 2].copy_from_slice(&bits.to_le_bytes());
+            if header >= 40 {
+                dib[16..20].copy_from_slice(&compression.to_le_bytes());
+                dib[32..36].copy_from_slice(&colors.to_le_bytes());
+            }
+            let bmp = build_bitmap_file(&dib).unwrap();
+            assert_eq!(&bmp[..2], b"BM");
+            assert_eq!(read_u32_at(&bmp, 2).unwrap() as usize, bmp.len());
+            assert_eq!(read_u32_at(&bmp, 10).unwrap() as usize, offset + 14);
+            assert_eq!(&bmp[14..], &dib);
+        }
+        assert!(build_bitmap_file(&[40, 0, 0, 0]).is_err());
+    }
 
     #[test]
     fn decodes_string_table_blocks() {

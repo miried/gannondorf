@@ -384,7 +384,12 @@ fn unres_extracts_resources_to_msvc_resource_script() {
             .dir
             .join("resources/resource_type_id_00C8_name_id_0066_lang_0409.bin"),
     );
-    run_resource_compiler(&generated_rc);
+    assert_contains(&generated_text, "IDB_0001 BITMAP");
+    assert_contains(&generated_text, "IDR_VERSION_0001 VERSIONINFO");
+    assert_contains(&generated_text, r#"L"Copyright \x00A9 \x263A\x0000""#);
+    let rebuilt = compile_empty_winmain_resource_app(&generated_rc);
+    assert_resource_fingerprints_match(&build.exe, &rebuilt);
+    assert_resource_physical_order_matches(&build.exe, &rebuilt);
 }
 
 #[test]
@@ -630,6 +635,19 @@ fn compile_resource_fixture() -> ResourceFixtureBuild {
         )
     });
     fs::write(dir.join("payload.bin"), b"raw resource payload").unwrap();
+    // One 24-bit pixel with a BITMAPINFOHEADER and DWORD-aligned row.
+    let mut bitmap = vec![0u8; 58];
+    bitmap[..2].copy_from_slice(b"BM");
+    bitmap[2..6].copy_from_slice(&58u32.to_le_bytes());
+    bitmap[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bitmap[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bitmap[18..22].copy_from_slice(&1u32.to_le_bytes());
+    bitmap[22..26].copy_from_slice(&1u32.to_le_bytes());
+    bitmap[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bitmap[28..30].copy_from_slice(&24u16.to_le_bytes());
+    bitmap[34..38].copy_from_slice(&4u32.to_le_bytes());
+    bitmap[54..57].copy_from_slice(&[0x11, 0x22, 0x33]);
+    fs::write(dir.join("input.bmp"), bitmap).unwrap();
 
     let resource_rc = dir.join("input.rc");
     fs::write(
@@ -646,6 +664,10 @@ fn compile_resource_fixture() -> ResourceFixtureBuild {
          102 200 \"payload.bin\"\n",
     )
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", resource_rc.display()));
+
+    let mut rc_text = fs::read_to_string(&resource_rc).unwrap();
+    rc_text.push_str(include_str!("fixtures/version_bitmap.rc"));
+    fs::write(&resource_rc, rc_text).unwrap();
 
     let resource_res = run_resource_compiler(&resource_rc);
     let compiler = test_tools_dir().join("MSDEV").join("BIN").join("CL.EXE");
